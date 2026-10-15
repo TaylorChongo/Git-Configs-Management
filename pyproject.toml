@@ -1,0 +1,47 @@
+[build-system]
+requires = ["poetry-core>=1.9.0"]
+build-backend = "poetry.core.masonry.api"
+
+[project]
+name = "git-configuration-cli"
+version = "0.1.0"
+description = "A Git-powered configuration management CLI."
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = [
+    "GitPython>=3.1.40",
+]
+
+[project.scripts]
+config-cli = "config_cli.cli:main"
+
+[tool.poetry.group.dev.dependencies]
+black = ">=24.0"
+mypy = ">=1.8"
+pre-commit = ">=3.6"
+pytest = ">=8.0"
+pytest-cov = ">=4.1"
+ruff = ">=0.3"
+
+[tool.poetry]
+packages = [{include = "config_cli", from = "src"}]
+
+[tool.black]
+line-length = 88
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["config_cli"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "--strict-markers"
