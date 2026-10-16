@@ -49,6 +49,18 @@ class InvalidRepoError(ConfigCliError):
         super().__init__(f"Invalid Git repository at {path}: {reason}")
 
 
+class BranchError(ConfigCliError):
+    """Raised when a branch cannot be created or checked out.
+
+    Attributes:
+        branch: The branch the operation was about.
+    """
+
+    def __init__(self, branch: str, reason: str) -> None:
+        self.branch = branch
+        super().__init__(f"Branch '{branch}': {reason}")
+
+
 class MergeConflictError(ConfigCliError):
     """Raised when publishing a draft branch causes a merge conflict.
 

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from config_cli.exceptions import (
+    BranchError,
     ConfigCliError,
     ConfigNotFound,
     InvalidConfigError,
@@ -21,12 +22,21 @@ from config_cli.exceptions import (
         ConfigNotFound(Path("app.yaml")),
         InvalidConfigError(Path("app.yaml"), "bad"),
         InvalidRepoError(Path("repo"), "not a git repository"),
+        BranchError("draft/x", "branch already exists"),
         MergeConflictError("draft/x", ["app.yaml"]),
     ],
 )
 def test_every_error_is_a_config_cli_error(error: ConfigCliError) -> None:
     """All custom errors share one parent so the CLI can catch them together."""
     assert isinstance(error, ConfigCliError)
+
+
+def test_branch_error_keeps_branch_and_reason() -> None:
+    """BranchError should name the branch and explain the problem."""
+    error = BranchError("draft/db", "branch already exists")
+
+    assert error.branch == "draft/db"
+    assert str(error) == "Branch 'draft/db': branch already exists"
 
 
 def test_config_not_found_keeps_path_and_message() -> None:

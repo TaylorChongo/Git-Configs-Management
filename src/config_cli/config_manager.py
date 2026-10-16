@@ -6,11 +6,17 @@ from pathlib import Path
 
 from config_cli.config_parser import ConfigData, ConfigParser
 from config_cli.exceptions import InvalidConfigError
-from config_cli.git_repository import GitRepository
+from config_cli.git_repository import MAIN_BRANCH, GitRepository
+
+DRAFT_PREFIX = "draft/"
 
 
 class ConfigManager:
     """Save configuration files into a Git repository as commits.
+
+    Changes can be made directly on ``main`` or on a draft. A draft is a Git
+    branch named ``draft/<name>`` that starts from ``main``, so work can be
+    prepared without affecting the published configuration.
 
     The manager does not read files or talk to Git itself. It coordinates a
     ``ConfigParser`` (file format) and a ``GitRepository`` (version history),
@@ -55,6 +61,56 @@ class ConfigManager:
 
         self._parser.write(full_path, data)
         return self._repo.commit_files([relative_path], message)
+
+    def start_draft(self, name: str) -> str:
+        """Create a draft from ``main`` and switch to it.
+
+        Args:
+            name: The draft's name, e.g. ``"new-db-settings"``.
+
+        Returns:
+            The draft's branch name, e.g. ``"draft/new-db-settings"``.
+
+        Raises:
+            BranchError: If the name is invalid, the draft already exists, or
+                there are uncommitted changes.
+        """
+        branch = DRAFT_PREFIX + name
+        self._repo.create_branch(branch, start_point=MAIN_BRANCH)
+        return branch
+
+    def switch_to_draft(self, name: str) -> None:
+        """Switch to an existing draft so further saves go onto it.
+
+        Raises:
+            BranchError: If the draft does not exist or there are uncommitted
+                changes.
+        """
+        self._repo.checkout(DRAFT_PREFIX + name)
+
+    def switch_to_main(self) -> None:
+        """Switch back to ``main``, the published configuration.
+
+        Raises:
+            BranchError: If there are uncommitted changes.
+        """
+        self._repo.checkout(MAIN_BRANCH)
+
+    def list_drafts(self) -> list[str]:
+        """Return the names of all drafts, without the ``draft/`` prefix."""
+        return [
+            branch.removeprefix(DRAFT_PREFIX)
+            for branch in self._repo.list_branches()
+            if branch.startswith(DRAFT_PREFIX)
+        ]
+
+    @property
+    def current_draft(self) -> str | None:
+        """The draft currently checked out, or ``None`` when on another branch."""
+        branch = self._repo.current_branch
+        if branch.startswith(DRAFT_PREFIX):
+            return branch.removeprefix(DRAFT_PREFIX)
+        return None
 
     def _resolve_name(self, name: str) -> Path:
         """Turn a user-supplied name into a safe path relative to the repo root.

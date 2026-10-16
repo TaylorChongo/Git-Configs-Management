@@ -7,8 +7,8 @@ from git import Repo
 
 from config_cli.config_manager import ConfigManager
 from config_cli.config_parser import ConfigParser
-from config_cli.exceptions import InvalidConfigError
-from config_cli.git_repository import GitRepository
+from config_cli.exceptions import BranchError, InvalidConfigError
+from config_cli.git_repository import MAIN_BRANCH, GitRepository
 
 
 @pytest.fixture
@@ -134,3 +134,89 @@ def test_save_unsupported_format_writes_and_commits_nothing(
 
     assert not (config_repo.path / "notes.txt").exists()
     assert commit_count(config_repo) == 1
+
+
+# --- Drafts ----------------------------------------------------------------
+
+
+def test_start_draft_creates_draft_branch_and_switches_to_it(
+    manager: ConfigManager, config_repo: GitRepository
+) -> None:
+    """A draft is a 'draft/<name>' branch that becomes the active branch."""
+    branch = manager.start_draft("new-db")
+
+    assert branch == "draft/new-db"
+    assert Repo(config_repo.path).active_branch.name == "draft/new-db"
+    assert manager.current_draft == "new-db"
+
+
+def test_saving_on_draft_does_not_change_main(
+    manager: ConfigManager, config_repo: GitRepository
+) -> None:
+    """Changes made on a draft must stay off main until published."""
+    manager.save("app.yaml", {"port": 5432})
+    manager.start_draft("new-port")
+
+    manager.save("app.yaml", {"port": 6000})
+
+    repo = Repo(config_repo.path)
+    main_blob = repo.heads[MAIN_BRANCH].commit.tree / "app.yaml"
+    draft_blob = repo.heads["draft/new-port"].commit.tree / "app.yaml"
+    assert main_blob.data_stream.read() == b"port: 5432\n"
+    assert draft_blob.data_stream.read() == b"port: 6000\n"
+
+
+def test_draft_starts_from_main_even_when_on_another_draft(
+    manager: ConfigManager, config_repo: GitRepository
+) -> None:
+    """A new draft must not inherit unpublished work from the current draft."""
+    manager.start_draft("first")
+    manager.save("first.yaml", {"a": 1})
+
+    manager.start_draft("second")
+
+    assert not (config_repo.path / "first.yaml").exists()
+
+
+def test_switch_between_drafts_and_main(
+    manager: ConfigManager, config_repo: GitRepository
+) -> None:
+    """Switching changes which version of the files is on disk."""
+    manager.save("app.yaml", {"port": 5432})
+    manager.start_draft("new-port")
+    manager.save("app.yaml", {"port": 6000})
+
+    manager.switch_to_main()
+    assert manager.current_draft is None
+    assert (config_repo.path / "app.yaml").read_bytes() == b"port: 5432\n"
+
+    manager.switch_to_draft("new-port")
+    assert manager.current_draft == "new-port"
+    assert (config_repo.path / "app.yaml").read_bytes() == b"port: 6000\n"
+
+
+def test_list_drafts_returns_only_draft_names(manager: ConfigManager) -> None:
+    """main is not a draft, and names are shown without the prefix."""
+    manager.start_draft("b-draft")
+    manager.start_draft("a-draft")
+
+    assert manager.list_drafts() == ["a-draft", "b-draft"]
+
+
+def test_list_drafts_is_empty_for_new_repository(manager: ConfigManager) -> None:
+    """A fresh repository has no drafts."""
+    assert manager.list_drafts() == []
+
+
+def test_start_draft_twice_raises(manager: ConfigManager) -> None:
+    """Starting a draft that already exists should raise BranchError."""
+    manager.start_draft("new-db")
+
+    with pytest.raises(BranchError, match="already exists"):
+        manager.start_draft("new-db")
+
+
+def test_switch_to_missing_draft_raises(manager: ConfigManager) -> None:
+    """Switching to an unknown draft should raise BranchError."""
+    with pytest.raises(BranchError, match="does not exist"):
+        manager.switch_to_draft("nope")

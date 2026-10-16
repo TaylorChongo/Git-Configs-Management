@@ -7,8 +7,13 @@ from pathlib import Path
 import pytest
 from git import Repo
 
-from config_cli.exceptions import InvalidRepoError
-from config_cli.git_repository import DEFAULT_GITIGNORE, MAIN_BRANCH, GitRepository
+from config_cli.exceptions import BranchError, InvalidRepoError
+from config_cli.git_repository import (
+    DEFAULT_GITATTRIBUTES,
+    DEFAULT_GITIGNORE,
+    MAIN_BRANCH,
+    GitRepository,
+)
 
 # These tests check the result with GitPython's own ``Repo`` instead of
 # GitRepository, so they confirm the real Git state rather than trusting
@@ -24,16 +29,36 @@ def test_init_creates_repository_on_main(config_repo: GitRepository) -> None:
     assert config_repo.current_branch == MAIN_BRANCH
 
 
-def test_init_makes_one_commit_with_gitignore(config_repo: GitRepository) -> None:
-    """main should start with exactly one commit that tracks .gitignore."""
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [(".gitignore", DEFAULT_GITIGNORE), (".gitattributes", DEFAULT_GITATTRIBUTES)],
+)
+def test_init_makes_one_commit_with_repo_files(
+    config_repo: GitRepository, filename: str, content: str
+) -> None:
+    """main should start with one commit holding .gitignore and .gitattributes."""
     repo = Repo(config_repo.path)
     commits = list(repo.iter_commits(MAIN_BRANCH))
 
     assert len(commits) == 1
     assert commits[0].message == "Initialize configuration repository"
-    assert ".gitignore" in commits[0].tree
-    gitignore = (config_repo.path / ".gitignore").read_text(encoding="utf-8")
-    assert gitignore == DEFAULT_GITIGNORE
+    # Compare raw bytes: reading as text on Windows would hide \r\n endings.
+    expected = content.encode("utf-8")
+    assert (commits[0].tree / filename).data_stream.read() == expected
+    assert (config_repo.path / filename).read_bytes() == expected
+
+
+def test_checkout_keeps_lf_line_endings(config_repo: GitRepository) -> None:
+    """Switching branches must not convert files to CRLF, even on Windows."""
+    (config_repo.path / "app.yaml").write_bytes(b"port: 80\n")
+    config_repo.commit_files([Path("app.yaml")], "Add app.yaml")
+    config_repo.create_branch("feature")
+    (config_repo.path / "app.yaml").write_bytes(b"port: 81\n")
+    config_repo.commit_files([Path("app.yaml")], "Change port")
+
+    config_repo.checkout(MAIN_BRANCH)
+
+    assert (config_repo.path / "app.yaml").read_bytes() == b"port: 80\n"
 
 
 def test_init_leaves_working_tree_clean(config_repo: GitRepository) -> None:
@@ -114,3 +139,87 @@ def test_commit_files_skips_commit_when_nothing_changed(
 
     assert sha is None
     assert len(list(Repo(config_repo.path).iter_commits())) == 2
+
+
+def test_create_branch_starts_from_main_and_checks_it_out(
+    config_repo: GitRepository,
+) -> None:
+    """A new branch should point at main's latest commit and become active."""
+    repo = Repo(config_repo.path)
+    main_commit = repo.heads[MAIN_BRANCH].commit
+
+    config_repo.create_branch("feature")
+
+    assert repo.active_branch.name == "feature"
+    assert repo.heads["feature"].commit == main_commit
+
+
+def test_create_branch_refuses_existing_name(config_repo: GitRepository) -> None:
+    """Creating a branch twice must not reset the existing one."""
+    config_repo.create_branch("feature")
+
+    with pytest.raises(BranchError, match="already exists"):
+        config_repo.create_branch("feature")
+
+
+def test_create_branch_requires_existing_start_point(
+    config_repo: GitRepository,
+) -> None:
+    """The branch to start from has to exist."""
+    with pytest.raises(BranchError, match="does not exist") as excinfo:
+        config_repo.create_branch("feature", start_point="nope")
+
+    assert excinfo.value.branch == "nope"
+
+
+@pytest.mark.parametrize("name", ["has space", "double..dot", "ends/", "-dash", ""])
+def test_create_branch_rejects_invalid_names(
+    config_repo: GitRepository, name: str
+) -> None:
+    """Names Git does not allow should raise BranchError, not a Git error."""
+    with pytest.raises(BranchError, match="invalid branch name"):
+        config_repo.create_branch(name)
+
+    assert config_repo.list_branches() == [MAIN_BRANCH]
+
+
+def test_checkout_switches_branch(config_repo: GitRepository) -> None:
+    """checkout should make the named branch the active one."""
+    config_repo.create_branch("feature")
+
+    config_repo.checkout(MAIN_BRANCH)
+
+    assert Repo(config_repo.path).active_branch.name == MAIN_BRANCH
+
+
+def test_checkout_missing_branch_raises(config_repo: GitRepository) -> None:
+    """Switching to a branch that does not exist should raise BranchError."""
+    with pytest.raises(BranchError, match="does not exist"):
+        config_repo.checkout("nope")
+
+
+@pytest.mark.parametrize("action", ["create", "checkout"])
+def test_branch_switch_refuses_uncommitted_changes(
+    config_repo: GitRepository, action: str
+) -> None:
+    """Switching branches with unsaved edits could lose them, so refuse."""
+    config_repo.create_branch("feature")
+    config_repo.checkout(MAIN_BRANCH)
+    (config_repo.path / "scratch.yaml").write_bytes(b"a: 1\n")
+
+    with pytest.raises(BranchError, match="uncommitted changes"):
+        if action == "create":
+            config_repo.create_branch("other")
+        else:
+            config_repo.checkout("feature")
+
+    assert config_repo.current_branch == MAIN_BRANCH
+    assert (config_repo.path / "scratch.yaml").exists()
+
+
+def test_list_branches_is_sorted(config_repo: GitRepository) -> None:
+    """list_branches should return every local branch in alphabetical order."""
+    config_repo.create_branch("zeta")
+    config_repo.create_branch("alpha")
+
+    assert config_repo.list_branches() == ["alpha", MAIN_BRANCH, "zeta"]
