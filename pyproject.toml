@@ -23,6 +23,7 @@ pre-commit = ">=3.6"
 pytest = ">=8.0"
 pytest-cov = ">=4.1"
 ruff = ">=0.3"
+types-pyyaml = ">=6.0"
 
 [tool.poetry]
 packages = [{include = "config_cli", from = "src"}]
@@ -40,9 +41,18 @@ select = ["E", "F", "I", "B", "UP"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
-packages = ["config_cli"]
+files = ["src", "tests"]
+mypy_path = "src"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "--strict-markers"
+
+[tool.coverage.run]
+source = ["config_cli"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 95

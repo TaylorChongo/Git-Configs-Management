@@ -1,18 +1,33 @@
-# The precommit file tells Git what checks to run automatically before each commit.
+# Checks that run automatically before each commit (install with
+# `poetry run pre-commit install`, run by hand with
+# `poetry run pre-commit run --all-files`).
 
 repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace # removes spaces at the end of lines
+      - id: end-of-file-fixer # makes every file end with one newline
+      - id: check-yaml # rejects broken YAML files
+      - id: check-toml # rejects a broken pyproject.toml
+      - id: check-merge-conflict # rejects leftover <<<<<<< conflict markers
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.6.9
+    rev: v0.17.0
     hooks:
-      - id: ruff #finds code problems automatically fixes them
+      - id: ruff-check # finds likely bugs and unsorted imports, fixing what it can
         args: ["--fix"]
-      - id: ruff-format #formats the code autmatically
-  - repo: https://github.com/psf/black
-    rev: 24.8.0
+  - repo: https://github.com/psf/black-pre-commit-mirror
+    rev: 26.10.1
     hooks:
-      - id: black # makes sure the code follows the same style
+      - id: black # formats the code in one consistent style
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.11.2
+    rev: v2.4.0
     hooks:
-      - id: mypy
-
+      - id: mypy # checks that the type hints are used correctly
+        args: []
+        pass_filenames: false # check the whole project, using pyproject.toml
+        additional_dependencies:
+          - GitPython>=3.1.40
+          - PyYAML>=6.0
+          - types-PyYAML
+          - pytest>=8.0
