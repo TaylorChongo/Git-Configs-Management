@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from config_cli.config_parser import ConfigData, ConfigParser
-from config_cli.exceptions import InvalidConfigError
+from config_cli.exceptions import InvalidConfigError, MergeConflictError
 from config_cli.git_repository import MAIN_BRANCH, GitRepository
 
 DRAFT_PREFIX = "draft/"
@@ -117,9 +117,81 @@ class ConfigManager:
             MergeConflictError: If the draft and ``main`` changed the same lines.
         """
         branch = DRAFT_PREFIX + name
-        sha = self._repo.merge(branch, MAIN_BRANCH, message or f"Publish draft {name}")
+        try:
+            sha = self._repo.merge(
+                branch, MAIN_BRANCH, message or f"Publish draft {name}"
+            )
+        except MergeConflictError as error:
+            raise MergeConflictError(
+                branch,
+                error.conflicted_files,
+                "The publish was cancelled and main is unchanged. Sync the draft "
+                "with main, fix the conflicts there, then publish again.",
+            ) from error
         self._repo.delete_branch(branch)
         return sha
+
+    def sync_draft(self, name: str) -> str:
+        """Bring the latest changes from ``main`` into a draft.
+
+        Use this when publishing reports a conflict. The conflict then happens
+        on the draft, where it is safe to fix, instead of on ``main``. The
+        draft is left checked out.
+
+        Args:
+            name: The draft to update.
+
+        Returns:
+            The SHA of the merge commit on the draft.
+
+        Raises:
+            BranchError: If the draft does not exist, is already up to date
+                with ``main``, or there are uncommitted changes.
+            MergeConflictError: If the draft and ``main`` changed the same
+                lines. The merge is left in progress on the draft so the
+                conflicts can be fixed, then completed with :meth:`finish_sync`
+                or undone with :meth:`abort_sync`.
+        """
+        branch = DRAFT_PREFIX + name
+        try:
+            return self._repo.merge(
+                MAIN_BRANCH,
+                branch,
+                f"Sync draft {name} with main",
+                keep_conflicts=True,
+            )
+        except MergeConflictError as error:
+            raise MergeConflictError(
+                branch,
+                error.conflicted_files,
+                "Open these files in the draft, keep the values you want and "
+                "delete the conflict markers (<<<<<<<, =======, >>>>>>>), then "
+                "finish the sync. Or abort the sync to undo it.",
+            ) from error
+
+    def finish_sync(self) -> str:
+        """Commit a sync once its conflicts have been fixed by hand.
+
+        Every previously conflicted configuration file is checked first: it
+        must have no conflict markers left and must be valid JSON/YAML.
+
+        Returns:
+            The SHA of the merge commit on the draft.
+
+        Raises:
+            BranchError: If no sync is in progress.
+            MergeConflictError: If conflict markers are still present.
+            InvalidConfigError: If a fixed file is not valid JSON/YAML.
+        """
+        return self._repo.finish_merge(validate=self._validate_config)
+
+    def abort_sync(self) -> None:
+        """Undo a sync that stopped on a conflict, restoring the draft.
+
+        Raises:
+            BranchError: If no sync is in progress.
+        """
+        self._repo.abort_merge()
 
     def list_drafts(self) -> list[str]:
         """Return the names of all drafts, without the ``draft/`` prefix."""
@@ -136,6 +208,11 @@ class ConfigManager:
         if branch.startswith(DRAFT_PREFIX):
             return branch.removeprefix(DRAFT_PREFIX)
         return None
+
+    def _validate_config(self, path: Path) -> None:
+        """Raise InvalidConfigError if a supported config file cannot be parsed."""
+        if self._parser.supports(path):
+            self._parser.read(path)
 
     def _resolve_name(self, name: str) -> Path:
         """Turn a user-supplied name into a safe path relative to the repo root.

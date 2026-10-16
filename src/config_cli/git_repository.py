@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import Callable
 from pathlib import Path
 
 from git import GitCommandError, InvalidGitRepositoryError, NoSuchPathError, Repo
@@ -28,6 +30,9 @@ _INITIAL_FILES = {
     ".gitignore": DEFAULT_GITIGNORE,
     ".gitattributes": DEFAULT_GITATTRIBUTES,
 }
+
+# The lines Git writes into a file to mark a conflict: <<<<<<<, ======= and >>>>>>>.
+_CONFLICT_MARKER = re.compile(rb"^(<{7}|={7}|>{7})( |\r?$)", re.MULTILINE)
 
 
 class GitRepository:
@@ -106,7 +111,12 @@ class GitRepository:
         Returns:
             The new commit's SHA, or ``None`` if the files had no changes,
             in which case no commit is made.
+
+        Raises:
+            BranchError: If a merge is in progress. A normal commit then would
+                silently drop the merge, so it has to be finished first.
         """
+        self._ensure_no_merge_in_progress()
         self._repo.index.add([path.as_posix() for path in paths])
         if not self._repo.index.diff("HEAD"):
             return None
@@ -148,17 +158,28 @@ class GitRepository:
 
         self._repo.heads[name].checkout()
 
-    def merge(self, source: str, target: str, message: str) -> str:
+    def merge(
+        self, source: str, target: str, message: str, keep_conflicts: bool = False
+    ) -> str:
         """Merge ``source`` into ``target`` with a merge commit.
 
-        ``target`` is left checked out on success. On any failure the merge
-        is cancelled and the originally checked-out branch is restored, so the
-        repository looks exactly as it did before the call.
+        ``target`` is left checked out on success. On a conflict, what happens
+        depends on ``keep_conflicts``:
+
+        * ``False`` (default): the merge is cancelled and the originally
+          checked-out branch is restored, so nothing changes.
+        * ``True``: the merge is left in progress on ``target``, with conflict
+          markers in the files, so the user can fix them and then call
+          :meth:`finish_merge` or :meth:`abort_merge`.
+
+        Any other Git failure is always cancelled.
 
         Args:
             source: The branch whose changes are merged in.
             target: The branch that receives the changes.
             message: The merge commit's message.
+            keep_conflicts: Leave a conflicted merge in progress instead of
+                cancelling it.
 
         Returns:
             The SHA of the new merge commit.
@@ -186,14 +207,86 @@ class GitRepository:
             # exactly when a branch was merged, even if Git could fast-forward.
             self._repo.git.merge("--no-ff", "-m", message, source)
         except GitCommandError as error:
-            conflicted_files = self._conflicted_files()
-            self._abort_merge()
+            conflicted_files = self.conflicted_files()
+            if conflicted_files and keep_conflicts:
+                raise MergeConflictError(
+                    source,
+                    conflicted_files,
+                    "Edit these files to keep the right values and remove the "
+                    "conflict markers (<<<<<<<, =======, >>>>>>>), then finish "
+                    "the merge, or abort it to go back.",
+                ) from error
+
+            self._cancel_merge()
             self._repo.heads[original_branch].checkout()
             if conflicted_files:
-                raise MergeConflictError(source, conflicted_files) from error
+                raise MergeConflictError(
+                    source,
+                    conflicted_files,
+                    f"The merge was cancelled, so '{target}' is unchanged.",
+                ) from error
             raise BranchError(source, f"could not be merged into '{target}'") from error
 
         return self._repo.head.commit.hexsha
+
+    def finish_merge(self, validate: Callable[[Path], None] | None = None) -> str:
+        """Commit a merge whose conflicts the user has fixed by hand.
+
+        Args:
+            validate: Optional check run on each previously conflicted file
+                (given as a full path) before anything is committed. It should
+                raise an exception if the file is not acceptable.
+
+        Returns:
+            The SHA of the merge commit.
+
+        Raises:
+            BranchError: If no merge is in progress.
+            MergeConflictError: If a conflicted file still contains conflict
+                markers. Nothing is committed in that case.
+            Exception: Whatever ``validate`` raises. Nothing is committed.
+        """
+        if not self.merge_in_progress:
+            raise BranchError(self.current_branch, "no merge is in progress")
+
+        files = self.conflicted_files()
+        unresolved = [name for name in files if self._has_conflict_markers(name)]
+        if unresolved:
+            raise MergeConflictError(
+                self.current_branch,
+                unresolved,
+                "These files still contain conflict markers "
+                "(<<<<<<<, =======, >>>>>>>). Remove them, then finish again.",
+            )
+        if validate is not None:
+            for name in files:
+                if (self.path / name).exists():
+                    validate(self.path / name)
+
+        if files:
+            self._repo.git.add("--", *files)
+        # --no-edit reuses the message Git saved when the merge started.
+        self._repo.git.commit("--no-edit")
+        return self._repo.head.commit.hexsha
+
+    def abort_merge(self) -> None:
+        """Cancel the merge in progress, restoring the files to before it began.
+
+        Raises:
+            BranchError: If no merge is in progress.
+        """
+        if not self.merge_in_progress:
+            raise BranchError(self.current_branch, "no merge is in progress")
+        self._cancel_merge()
+
+    def conflicted_files(self) -> list[str]:
+        """Return the files Git could not merge automatically, sorted.
+
+        The list is empty when no merge is in progress. Files stay on the
+        list until the merge is finished, even after they have been edited.
+        """
+        output = self._repo.git.diff("--name-only", "--diff-filter=U")
+        return sorted(output.splitlines())
 
     def delete_branch(self, name: str) -> None:
         """Delete a branch whose changes are already merged.
@@ -231,24 +324,41 @@ class GitRepository:
         except GitCommandError as error:
             raise BranchError(name, "invalid branch name") from error
 
-    def _conflicted_files(self) -> list[str]:
-        """Return the files left unmerged by a failed merge, sorted."""
-        output = self._repo.git.diff("--name-only", "--diff-filter=U")
-        return sorted(output.splitlines())
-
-    def _abort_merge(self) -> None:
+    def _cancel_merge(self) -> None:
         """Cancel a merge in progress, if there is one."""
-        if (Path(self._repo.git_dir) / "MERGE_HEAD").exists():
+        if self.merge_in_progress:
             self._repo.git.merge("--abort")
 
+    def _has_conflict_markers(self, name: str) -> bool:
+        """Return whether a file still contains Git's conflict marker lines."""
+        path = self.path / name
+        return path.exists() and bool(_CONFLICT_MARKER.search(path.read_bytes()))
+
+    def _ensure_no_merge_in_progress(self) -> None:
+        """Raise BranchError if a merge has been started but not finished."""
+        if self.merge_in_progress:
+            raise BranchError(
+                self.current_branch,
+                "a merge is in progress; finish or abort it first",
+            )
+
     def _ensure_clean(self, branch: str) -> None:
-        """Raise BranchError if the working tree has uncommitted changes."""
+        """Raise BranchError if a merge is unfinished or files are uncommitted."""
+        self._ensure_no_merge_in_progress()
         if self._repo.is_dirty(untracked_files=True):
             raise BranchError(
                 branch,
                 "the repository has uncommitted changes; "
                 "commit or discard them first",
             )
+
+    @property
+    def merge_in_progress(self) -> bool:
+        """Whether a merge has been started but not yet finished or aborted.
+
+        Git records an unfinished merge in a ``.git/MERGE_HEAD`` file.
+        """
+        return (Path(self._repo.git_dir) / "MERGE_HEAD").exists()
 
     @property
     def path(self) -> Path:

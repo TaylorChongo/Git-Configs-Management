@@ -270,7 +270,9 @@ def test_publish_conflict_keeps_main_and_draft(
     with pytest.raises(MergeConflictError) as excinfo:
         manager.publish("new-port")
 
+    assert excinfo.value.branch == "draft/new-port"
     assert excinfo.value.conflicted_files == ["app.yaml"]
+    assert "Sync the draft with main" in str(excinfo.value)
     assert Repo(config_repo.path).heads[MAIN_BRANCH].commit == main_before
     assert manager.list_drafts() == ["new-port"]
     assert manager.current_draft == "new-port"
@@ -290,3 +292,128 @@ def test_publish_empty_draft_raises(manager: ConfigManager) -> None:
         manager.publish("empty")
 
     assert manager.list_drafts() == ["empty"]
+
+
+# --- Syncing drafts and resolving conflicts --------------------------------
+
+
+@pytest.fixture
+def conflicting_draft(manager: ConfigManager) -> ConfigManager:
+    """A draft and main that both changed the port in app.yaml."""
+    manager.save("app.yaml", {"port": 5432})
+    manager.start_draft("new-port")
+    manager.save("app.yaml", {"port": 6000})
+    manager.switch_to_main()
+    manager.save("app.yaml", {"port": 7000})
+    return manager
+
+
+@pytest.fixture
+def syncing_draft(conflicting_draft: ConfigManager) -> ConfigManager:
+    """A draft whose sync with main has stopped on a conflict."""
+    with pytest.raises(MergeConflictError):
+        conflicting_draft.sync_draft("new-port")
+    return conflicting_draft
+
+
+def test_sync_brings_main_changes_into_draft(
+    manager: ConfigManager, config_repo: GitRepository
+) -> None:
+    """Changes published on main since the draft started should reach it."""
+    manager.start_draft("db")
+    manager.save("db.yaml", {"host": "db1"})
+    manager.switch_to_main()
+    manager.save("app.yaml", {"port": 5432})
+
+    sha = manager.sync_draft("db")
+
+    head = Repo(config_repo.path).heads["draft/db"].commit
+    assert sha == head.hexsha
+    assert head.message.strip() == "Sync draft db with main"
+    assert manager.current_draft == "db"
+    assert (config_repo.path / "app.yaml").exists()
+    assert (config_repo.path / "db.yaml").exists()
+
+
+def test_sync_up_to_date_draft_raises(manager: ConfigManager) -> None:
+    """A draft that already has everything from main has nothing to sync."""
+    manager.start_draft("db")
+
+    with pytest.raises(BranchError, match="no new commits"):
+        manager.sync_draft("db")
+
+
+def test_sync_conflict_is_left_on_the_draft(
+    conflicting_draft: ConfigManager, config_repo: GitRepository
+) -> None:
+    """A sync conflict stays on the draft, with guidance on what to do next."""
+    main_before = Repo(config_repo.path).heads[MAIN_BRANCH].commit
+
+    with pytest.raises(MergeConflictError) as excinfo:
+        conflicting_draft.sync_draft("new-port")
+
+    assert excinfo.value.branch == "draft/new-port"
+    assert excinfo.value.conflicted_files == ["app.yaml"]
+    assert "finish the sync" in str(excinfo.value)
+    assert conflicting_draft.current_draft == "new-port"
+    assert config_repo.merge_in_progress
+    assert b"<<<<<<<" in (config_repo.path / "app.yaml").read_bytes()
+    assert Repo(config_repo.path).heads[MAIN_BRANCH].commit == main_before
+
+
+def test_full_conflict_resolution_then_publish(
+    syncing_draft: ConfigManager, config_repo: GitRepository
+) -> None:
+    """Sync, fix the file, finish, publish: the whole conflict workflow."""
+    (config_repo.path / "app.yaml").write_bytes(b"port: 6500\n")
+
+    syncing_draft.finish_sync()
+    syncing_draft.publish("new-port")
+
+    head = Repo(config_repo.path).heads[MAIN_BRANCH].commit
+    assert head.message.strip() == "Publish draft new-port"
+    assert (head.tree / "app.yaml").data_stream.read() == b"port: 6500\n"
+    assert syncing_draft.list_drafts() == []
+
+
+def test_finish_sync_refuses_leftover_markers(
+    syncing_draft: ConfigManager, config_repo: GitRepository
+) -> None:
+    """Finishing without removing the markers must not commit anything."""
+    with pytest.raises(MergeConflictError, match="still contain conflict markers"):
+        syncing_draft.finish_sync()
+
+    assert config_repo.merge_in_progress
+
+
+def test_finish_sync_refuses_invalid_config(
+    syncing_draft: ConfigManager, config_repo: GitRepository
+) -> None:
+    """A fixed file must still be valid YAML before it is committed."""
+    (config_repo.path / "app.yaml").write_bytes(b"port: [6500\n")
+
+    with pytest.raises(InvalidConfigError, match="could not be parsed"):
+        syncing_draft.finish_sync()
+
+    assert config_repo.merge_in_progress
+
+
+def test_abort_sync_restores_draft(
+    syncing_draft: ConfigManager, config_repo: GitRepository
+) -> None:
+    """Aborting a sync puts the draft back exactly as it was."""
+    syncing_draft.abort_sync()
+
+    assert not config_repo.merge_in_progress
+    assert syncing_draft.current_draft == "new-port"
+    assert (config_repo.path / "app.yaml").read_bytes() == b"port: 6000\n"
+
+
+def test_save_is_refused_during_sync(
+    syncing_draft: ConfigManager, config_repo: GitRepository
+) -> None:
+    """Saving mid-sync would silently drop the merge, so it is refused."""
+    with pytest.raises(BranchError, match="merge is in progress"):
+        syncing_draft.save("other.yaml", {"a": 1})
+
+    assert config_repo.merge_in_progress

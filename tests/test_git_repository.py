@@ -373,3 +373,116 @@ def test_delete_missing_branch_raises(config_repo: GitRepository) -> None:
     """Deleting a branch that does not exist should raise BranchError."""
     with pytest.raises(BranchError, match="does not exist"):
         config_repo.delete_branch("nope")
+
+
+# --- Resolving conflicts by hand -------------------------------------------
+
+
+@pytest.fixture
+def conflicted_merge(diverged_repo: GitRepository) -> GitRepository:
+    """A repo with main merged into 'feature' and stopped on a conflict."""
+    with pytest.raises(MergeConflictError):
+        diverged_repo.merge(MAIN_BRANCH, "feature", "Sync", keep_conflicts=True)
+    return diverged_repo
+
+
+def test_merge_keep_conflicts_leaves_merge_in_progress(
+    conflicted_merge: GitRepository,
+) -> None:
+    """With keep_conflicts, the conflict is left on the target for the user."""
+    assert conflicted_merge.merge_in_progress
+    assert conflicted_merge.current_branch == "feature"
+    assert conflicted_merge.conflicted_files() == ["app.yaml"]
+    content = (conflicted_merge.path / "app.yaml").read_bytes()
+    assert b"<<<<<<<" in content
+    assert b"port: 81" in content
+    assert b"port: 82" in content
+
+
+def test_finish_merge_commits_fixed_files(conflicted_merge: GitRepository) -> None:
+    """After the user fixes the file, finishing creates the merge commit."""
+    (conflicted_merge.path / "app.yaml").write_bytes(b"port: 90\n")
+    repo = Repo(conflicted_merge.path)
+    feature_before = repo.heads["feature"].commit
+    main_commit = repo.heads[MAIN_BRANCH].commit
+
+    sha = conflicted_merge.finish_merge()
+
+    head = repo.heads["feature"].commit
+    assert sha == head.hexsha
+    assert set(head.parents) == {feature_before, main_commit}
+    assert (head.tree / "app.yaml").data_stream.read() == b"port: 90\n"
+    assert not conflicted_merge.merge_in_progress
+    assert not repo.is_dirty(untracked_files=True)
+
+
+def test_finish_merge_refuses_leftover_markers(
+    conflicted_merge: GitRepository,
+) -> None:
+    """Committing a file that still has conflict markers would break it."""
+    with pytest.raises(MergeConflictError, match="still contain conflict markers"):
+        conflicted_merge.finish_merge()
+
+    assert conflicted_merge.merge_in_progress
+
+
+def test_finish_merge_ignores_marker_text_inside_a_line(
+    conflicted_merge: GitRepository,
+) -> None:
+    """Only whole marker lines count, not the same characters inside a value."""
+    (conflicted_merge.path / "app.yaml").write_bytes(b"note: a ======= b\n")
+
+    conflicted_merge.finish_merge()
+
+    assert not conflicted_merge.merge_in_progress
+
+
+def test_finish_merge_runs_validation_before_committing(
+    conflicted_merge: GitRepository,
+) -> None:
+    """A failing validation must stop the commit and keep the merge open."""
+    (conflicted_merge.path / "app.yaml").write_bytes(b"port: 90\n")
+    checked: list[Path] = []
+
+    def reject(path: Path) -> None:
+        checked.append(path)
+        raise ValueError("not good enough")
+
+    with pytest.raises(ValueError, match="not good enough"):
+        conflicted_merge.finish_merge(validate=reject)
+
+    assert checked == [conflicted_merge.path / "app.yaml"]
+    assert conflicted_merge.merge_in_progress
+
+
+def test_abort_merge_restores_target(conflicted_merge: GitRepository) -> None:
+    """Aborting puts the target branch's files back as they were."""
+    conflicted_merge.abort_merge()
+
+    assert not conflicted_merge.merge_in_progress
+    assert (conflicted_merge.path / "app.yaml").read_bytes() == b"port: 81\n"
+    assert not Repo(conflicted_merge.path).is_dirty(untracked_files=True)
+
+
+@pytest.mark.parametrize("action", ["finish", "abort"])
+def test_finish_or_abort_without_merge_raises(
+    config_repo: GitRepository, action: str
+) -> None:
+    """There is nothing to finish or abort when no merge was started."""
+    with pytest.raises(BranchError, match="no merge is in progress"):
+        if action == "finish":
+            config_repo.finish_merge()
+        else:
+            config_repo.abort_merge()
+
+
+def test_commit_and_checkout_refused_during_merge(
+    conflicted_merge: GitRepository,
+) -> None:
+    """Normal work mid-merge would leave Git in a confusing state, so refuse."""
+    with pytest.raises(BranchError, match="merge is in progress"):
+        conflicted_merge.commit_files([Path("app.yaml")], "Sneaky commit")
+    with pytest.raises(BranchError, match="merge is in progress"):
+        conflicted_merge.checkout(MAIN_BRANCH)
+
+    assert conflicted_merge.current_branch == "feature"

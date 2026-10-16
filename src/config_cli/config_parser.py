@@ -88,10 +88,14 @@ class ConfigParser:
                 f"Could not write configuration file: {path}"
             ) from error
 
+    def supports(self, path: Path) -> bool:
+        """Return whether ``path`` has a file extension this parser can handle."""
+        suffix = path.suffix.lower()
+        return suffix == self._JSON_SUFFIX or suffix in self._YAML_SUFFIXES
+
     def _ensure_supported_format(self, path: Path) -> None:
         """Raise InvalidConfigError when a path does not use a supported format."""
-        suffix = path.suffix.lower()
-        if suffix != self._JSON_SUFFIX and suffix not in self._YAML_SUFFIXES:
+        if not self.supports(path):
             raise InvalidConfigError(
                 path,
                 f"unsupported format '{path.suffix or '<none>'}', "

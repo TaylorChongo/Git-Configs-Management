@@ -94,6 +94,23 @@ def test_write_uses_unix_line_endings(
     assert b"\r\n" not in path.read_bytes()
 
 
+@pytest.mark.parametrize(
+    ("filename", "expected"),
+    [
+        ("a.json", True),
+        ("a.YAML", True),
+        ("a.yml", True),
+        ("a.txt", False),
+        (".gitattributes", False),
+    ],
+)
+def test_supports_reports_known_formats(
+    parser: ConfigParser, filename: str, expected: bool
+) -> None:
+    """supports should say whether a file's extension can be parsed."""
+    assert parser.supports(Path(filename)) is expected
+
+
 # --- Error paths -----------------------------------------------------------
 
 

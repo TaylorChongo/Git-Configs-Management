@@ -65,16 +65,22 @@ def test_invalid_repo_error_includes_path_and_reason() -> None:
 
 
 def test_merge_conflict_error_lists_files_and_guidance() -> None:
-    """MergeConflictError should name the branch, files, and how to fix it."""
-    error = MergeConflictError("draft/db", ["app.yaml", "db.json"])
+    """MergeConflictError should name the branch, files, and what to do next."""
+    error = MergeConflictError("draft/db", ["app.yaml", "db.json"], "Do this.")
 
     assert error.branch == "draft/db"
     assert error.conflicted_files == ["app.yaml", "db.json"]
-    message = str(error)
-    assert "draft/db" in message
-    assert "app.yaml, db.json" in message
-    assert "main is unchanged" in message
-    assert "publish again" in message
+    assert error.guidance == "Do this."
+    assert str(error) == (
+        "Merge conflict with 'draft/db' in: app.yaml, db.json. Do this."
+    )
+
+
+def test_merge_conflict_error_has_default_guidance() -> None:
+    """Without specific guidance, the message still tells the user what to do."""
+    error = MergeConflictError("draft/db", ["app.yaml"])
+
+    assert "Resolve the conflicting changes" in str(error)
 
 
 def test_merge_conflict_error_without_files_says_unknown() -> None:
