@@ -12,6 +12,7 @@ from config_cli.exceptions import (
     CommitNotFoundError,
     ConfigNotFound,
     InvalidConfigError,
+    KeyNotFoundError,
     MergeConflictError,
 )
 from config_cli.git_repository import MAIN_BRANCH, GitRepository
@@ -531,3 +532,120 @@ def test_rollback_unknown_commit_raises(three_versions: ConfigManager) -> None:
     """A commit ID that does not exist should raise CommitNotFoundError."""
     with pytest.raises(CommitNotFoundError):
         three_versions.rollback("app.yaml", "deadbeef")
+
+
+# --- Reading and setting single values -------------------------------------
+
+
+@pytest.fixture
+def db_config(manager: ConfigManager) -> ConfigManager:
+    """app.yaml with a nested database section and a top-level flag."""
+    manager.save("app.yaml", {"database": {"host": "localhost", "port": 5432}})
+    return manager
+
+
+def test_read_returns_parsed_file(db_config: ConfigManager) -> None:
+    """read should return the whole configuration as Python data."""
+    assert db_config.read("app.yaml") == {
+        "database": {"host": "localhost", "port": 5432}
+    }
+
+
+def test_read_missing_file_raises(manager: ConfigManager) -> None:
+    """Reading a config that does not exist should raise ConfigNotFound."""
+    with pytest.raises(ConfigNotFound):
+        manager.read("nope.yaml")
+
+
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        ("database.port", 5432),
+        ("database.host", "localhost"),
+        ("database", {"host": "localhost", "port": 5432}),
+    ],
+)
+def test_get_value_follows_dotted_keys(
+    db_config: ConfigManager, key: str, expected: object
+) -> None:
+    """Dots step into nested sections; a section itself can be returned."""
+    assert db_config.get_value("app.yaml", key) == expected
+
+
+@pytest.mark.parametrize("key", ["database.user", "cache", "database.port.extra"])
+def test_get_value_missing_key_raises(db_config: ConfigManager, key: str) -> None:
+    """Unknown keys, including stepping into a plain value, are not found."""
+    with pytest.raises(KeyNotFoundError) as excinfo:
+        db_config.get_value("app.yaml", key)
+
+    assert excinfo.value.key == key
+
+
+@pytest.mark.parametrize("key", ["", "database..port", ".port", "database."])
+def test_malformed_keys_are_rejected(db_config: ConfigManager, key: str) -> None:
+    """Keys with empty parts are mistakes, not lookups."""
+    with pytest.raises(InvalidConfigError, match="invalid key"):
+        db_config.get_value("app.yaml", key)
+    with pytest.raises(InvalidConfigError, match="invalid key"):
+        db_config.set_value("app.yaml", key, 1)
+
+
+def test_set_value_updates_one_value_and_keeps_the_rest(
+    db_config: ConfigManager, config_repo: GitRepository
+) -> None:
+    """set_value changes one key, leaves the others, and commits."""
+    sha = db_config.set_value("app.yaml", "database.port", 5433)
+
+    head = Repo(config_repo.path).head.commit
+    assert sha == head.hexsha
+    assert head.message == "Set database.port in app.yaml"
+    assert db_config.read("app.yaml") == {
+        "database": {"host": "localhost", "port": 5433}
+    }
+
+
+def test_set_value_creates_missing_sections(db_config: ConfigManager) -> None:
+    """Sections along the key are created as needed."""
+    db_config.set_value("app.yaml", "cache.redis.ttl", 60)
+
+    assert db_config.get_value("app.yaml", "cache") == {"redis": {"ttl": 60}}
+
+
+def test_set_value_creates_missing_file(
+    manager: ConfigManager, config_repo: GitRepository
+) -> None:
+    """Setting a value in a file that does not exist yet creates it."""
+    manager.set_value("env/prod.json", "replicas", 3)
+
+    assert manager.read("env/prod.json") == {"replicas": 3}
+    assert not Repo(config_repo.path).is_dirty(untracked_files=True)
+
+
+def test_set_value_custom_message(
+    db_config: ConfigManager, config_repo: GitRepository
+) -> None:
+    """A caller-supplied message is used for the commit."""
+    db_config.set_value("app.yaml", "debug", True, message="Enable debug")
+
+    assert Repo(config_repo.path).head.commit.message == "Enable debug"
+
+
+def test_set_value_to_same_value_makes_no_commit(db_config: ConfigManager) -> None:
+    """Setting a value it already has changes nothing."""
+    assert db_config.set_value("app.yaml", "database.port", 5432) is None
+
+
+def test_set_value_through_a_plain_value_raises(db_config: ConfigManager) -> None:
+    """database.port is a number, so it cannot contain further keys."""
+    with pytest.raises(InvalidConfigError, match="'port' holds a value"):
+        db_config.set_value("app.yaml", "database.port.extra", 1)
+
+    assert db_config.get_value("app.yaml", "database.port") == 5432
+
+
+def test_set_value_in_list_file_raises(manager: ConfigManager) -> None:
+    """A file whose top level is a list has no keys to set."""
+    manager.save("servers.yaml", ["web1", "web2"])
+
+    with pytest.raises(InvalidConfigError, match="top level is a list"):
+        manager.set_value("servers.yaml", "web3", True)

@@ -13,6 +13,7 @@ from config_cli.exceptions import (
     ConfigNotFound,
     InvalidConfigError,
     InvalidRepoError,
+    KeyNotFoundError,
     MergeConflictError,
 )
 
@@ -22,6 +23,7 @@ from config_cli.exceptions import (
     [
         ConfigNotFound(Path("app.yaml")),
         InvalidConfigError(Path("app.yaml"), "bad"),
+        KeyNotFoundError(Path("app.yaml"), "database.port"),
         InvalidRepoError(Path("repo"), "not a git repository"),
         BranchError("draft/x", "branch already exists"),
         CommitNotFoundError("abc1234", "no such commit"),
@@ -31,6 +33,15 @@ from config_cli.exceptions import (
 def test_every_error_is_a_config_cli_error(error: ConfigCliError) -> None:
     """All custom errors share one parent so the CLI can catch them together."""
     assert isinstance(error, ConfigCliError)
+
+
+def test_key_not_found_error_names_key_and_file() -> None:
+    """KeyNotFoundError should say which key was missing from which file."""
+    error = KeyNotFoundError(Path("app.yaml"), "database.port")
+
+    assert error.key == "database.port"
+    assert error.path == Path("app.yaml")
+    assert str(error) == "Key 'database.port' not found in app.yaml"
 
 
 def test_branch_error_keeps_branch_and_reason() -> None:

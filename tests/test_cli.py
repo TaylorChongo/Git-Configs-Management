@@ -11,7 +11,9 @@ from git import Repo
 
 from config_cli import __version__
 from config_cli.cli import EXIT_ERROR, EXIT_OK, build_parser, main
-from config_cli.git_repository import MAIN_BRANCH
+from config_cli.config_manager import ConfigManager
+from config_cli.config_parser import ConfigParser
+from config_cli.git_repository import MAIN_BRANCH, GitRepository
 
 
 def test_cli_parser_has_expected_program_name() -> None:
@@ -110,3 +112,186 @@ def test_init_twice_reports_error(
     assert captured.err.startswith("Error: ")
     assert "already exists" in captured.err
     assert "Traceback" not in captured.err
+
+
+# --- save, set and show ----------------------------------------------------
+
+
+@pytest.fixture
+def repo_dir(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> Path:
+    """A freshly initialized config repository, with init's output discarded."""
+    path = tmp_path / "configs"
+    assert main(["-C", str(path), "init"]) == EXIT_OK
+    capsys.readouterr()
+    return path
+
+
+def run(repo_dir: Path, *args: str) -> int:
+    """Run a config-cli command against the test repository."""
+    return main(["-C", str(repo_dir), *args])
+
+
+def committed(repo_dir: Path, name: str) -> bytes:
+    """Return a file's content in the latest commit."""
+    blob = Repo(repo_dir).head.commit.tree / name
+    content: bytes = blob.data_stream.read()
+    return content
+
+
+def test_command_outside_a_repository_reports_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Commands other than init need an existing config repository."""
+    assert main(["-C", str(tmp_path), "show", "app.yaml"]) == EXIT_ERROR
+    assert "not a Git repository" in capsys.readouterr().err
+
+
+def test_save_from_local_file(
+    repo_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """save --from copies a local file into the repository and commits it."""
+    source = tmp_path / "local.yaml"
+    source.write_bytes(b"port: 5432\n")
+
+    exit_code = run(repo_dir, "save", "app.yaml", "--from", str(source))
+
+    assert exit_code == EXIT_OK
+    assert committed(repo_dir, "app.yaml") == b"port: 5432\n"
+    assert Repo(repo_dir).head.commit.message == "Create app.yaml"
+    assert "Saved app.yaml on main (commit " in capsys.readouterr().out
+
+
+def test_save_converts_between_formats(repo_dir: Path, tmp_path: Path) -> None:
+    """A JSON source saved under a .yaml name is stored as YAML."""
+    source = tmp_path / "local.json"
+    source.write_text('{"port": 5432, "debug": false}', encoding="utf-8")
+
+    run(repo_dir, "save", "app.yaml", "--from", str(source), "-m", "Import")
+
+    assert committed(repo_dir, "app.yaml") == b"port: 5432\ndebug: false\n"
+    assert Repo(repo_dir).head.commit.message == "Import"
+
+
+def test_save_unchanged_says_no_changes(
+    repo_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Saving identical content again reports that nothing changed."""
+    source = tmp_path / "local.yaml"
+    source.write_bytes(b"port: 5432\n")
+    run(repo_dir, "save", "app.yaml", "--from", str(source))
+    capsys.readouterr()
+
+    assert run(repo_dir, "save", "app.yaml", "--from", str(source)) == EXIT_OK
+    assert "No changes" in capsys.readouterr().out
+
+
+def test_save_missing_source_reports_error(
+    repo_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A --from file that does not exist is reported, and nothing is committed."""
+    commits_before = len(list(Repo(repo_dir).iter_commits()))
+
+    exit_code = run(repo_dir, "save", "app.yaml", "--from", str(tmp_path / "x.yaml"))
+
+    assert exit_code == EXIT_ERROR
+    assert "not found" in capsys.readouterr().err
+    assert len(list(Repo(repo_dir).iter_commits())) == commits_before
+
+
+def test_save_requires_from(repo_dir: Path) -> None:
+    """--from is required, so leaving it out is a usage error."""
+    with pytest.raises(SystemExit) as excinfo:
+        run(repo_dir, "save", "app.yaml")
+
+    assert excinfo.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("typed", "stored"),
+    [
+        ("5433", b"port: 5433\n"),
+        ("true", b"port: true\n"),
+        ("null", b"port: null\n"),
+        ("localhost", b"port: localhost\n"),
+        ('"5433"', b"port: '5433'\n"),
+        ("[1, 2]", b"port:\n- 1\n- 2\n"),
+        ("NaN", b"port: NaN\n"),
+    ],
+)
+def test_set_reads_value_as_json_or_text(
+    repo_dir: Path, typed: str, stored: bytes
+) -> None:
+    """VALUE becomes a number, boolean, list... or stays text if not JSON."""
+    assert run(repo_dir, "set", "app.yaml", "port", typed) == EXIT_OK
+
+    assert committed(repo_dir, "app.yaml") == stored
+
+
+def test_set_nested_key_and_report(
+    repo_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """set creates nested sections and reports the commit."""
+    run(repo_dir, "set", "app.yaml", "database.port", "5432")
+
+    assert committed(repo_dir, "app.yaml") == b"database:\n  port: 5432\n"
+    assert Repo(repo_dir).head.commit.message == "Set database.port in app.yaml"
+    assert "Saved app.yaml on main" in capsys.readouterr().out
+
+
+def test_set_on_a_draft_says_so(
+    repo_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The report says when the change went onto a draft."""
+    ConfigManager(GitRepository.open(repo_dir), ConfigParser()).start_draft("db")
+
+    run(repo_dir, "set", "app.yaml", "port", "1")
+
+    assert "Saved app.yaml on draft 'db'" in capsys.readouterr().out
+
+
+def test_set_invalid_key_reports_error(
+    repo_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Problems found by the engine are reported as short errors."""
+    assert run(repo_dir, "set", "app.yaml", "a..b", "1") == EXIT_ERROR
+    assert "invalid key 'a..b'" in capsys.readouterr().err
+
+
+def test_show_whole_file(repo_dir: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """show NAME prints the file in its own format."""
+    run(repo_dir, "set", "app.json", "port", "5432")
+    capsys.readouterr()
+
+    assert run(repo_dir, "show", "app.json") == EXIT_OK
+    assert capsys.readouterr().out == '{\n  "port": 5432\n}\n'
+
+
+@pytest.mark.parametrize(
+    ("key", "printed"),
+    [
+        ("database.host", "localhost\n"),
+        ("database.port", "5432\n"),
+        ("database", '{\n  "host": "localhost",\n  "port": 5432\n}\n'),
+    ],
+)
+def test_show_one_key(
+    repo_dir: Path, capsys: pytest.CaptureFixture[str], key: str, printed: str
+) -> None:
+    """show NAME KEY prints text as-is and anything else as JSON."""
+    run(repo_dir, "set", "app.yaml", "database.host", "localhost")
+    run(repo_dir, "set", "app.yaml", "database.port", "5432")
+    capsys.readouterr()
+
+    assert run(repo_dir, "show", "app.yaml", key) == EXIT_OK
+    assert capsys.readouterr().out == printed
+
+
+def test_show_missing_key_reports_error(
+    repo_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Asking for a key that is not there is a clear error."""
+    run(repo_dir, "set", "app.yaml", "port", "5432")
+    capsys.readouterr()
+
+    assert run(repo_dir, "show", "app.yaml", "host") == EXIT_ERROR
+    assert "Key 'host' not found" in capsys.readouterr().err

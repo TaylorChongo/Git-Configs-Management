@@ -37,6 +37,20 @@ class InvalidConfigError(ConfigCliError):
         super().__init__(f"Invalid configuration file {path}: {reason}")
 
 
+class KeyNotFoundError(ConfigCliError):
+    """Raised when a dotted key such as ``database.port`` is not in a config.
+
+    Attributes:
+        path: The configuration file that was searched.
+        key: The key that could not be found.
+    """
+
+    def __init__(self, path: Path, key: str) -> None:
+        self.path = path
+        self.key = key
+        super().__init__(f"Key '{key}' not found in {path}")
+
+
 class InvalidRepoError(ConfigCliError):
     """Raised when a path is not a usable Git repository.
 

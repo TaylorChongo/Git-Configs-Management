@@ -71,22 +71,42 @@ class ConfigParser:
                 be converted to JSON/YAML.
             ConfigCliError: If the file cannot be written.
         """
-        self._ensure_supported_format(path)
+        # Convert first, so a serialization error never leaves a half-written
+        # or empty file behind.
+        text = self.dumps(path, data)
 
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("w", encoding="utf-8", newline="\n") as config_file:
-                if path.suffix.lower() == self._JSON_SUFFIX:
-                    json.dump(data, config_file, indent=2)
-                    config_file.write("\n")
-                else:
-                    yaml.safe_dump(data, config_file, sort_keys=False)
-        except (TypeError, yaml.YAMLError) as error:
-            raise InvalidConfigError(path, "data could not be serialized") from error
+                config_file.write(text)
         except OSError as error:
             raise ConfigCliError(
                 f"Could not write configuration file: {path}"
             ) from error
+
+    def dumps(self, path: Path, data: ConfigData) -> str:
+        """Convert configuration data to text in the format ``path`` uses.
+
+        Nothing is written to disk; ``path`` only selects JSON or YAML.
+
+        Args:
+            path: A file name whose extension picks the format.
+            data: The configuration to convert.
+
+        Returns:
+            The formatted text, ending with a newline.
+
+        Raises:
+            InvalidConfigError: If the format is unsupported or the data cannot
+                be converted to JSON/YAML.
+        """
+        self._ensure_supported_format(path)
+        try:
+            if path.suffix.lower() == self._JSON_SUFFIX:
+                return json.dumps(data, indent=2) + "\n"
+            return yaml.safe_dump(data, sort_keys=False)
+        except (TypeError, yaml.YAMLError) as error:
+            raise InvalidConfigError(path, "data could not be serialized") from error
 
     def supports(self, path: Path) -> bool:
         """Return whether ``path`` has a file extension this parser can handle."""

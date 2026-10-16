@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from config_cli.config_parser import ConfigData, ConfigParser
-from config_cli.exceptions import ConfigNotFound, InvalidConfigError, MergeConflictError
+from config_cli.exceptions import (
+    ConfigNotFound,
+    InvalidConfigError,
+    KeyNotFoundError,
+    MergeConflictError,
+)
 from config_cli.git_repository import MAIN_BRANCH, CommitInfo, GitRepository
 
 DRAFT_PREFIX = "draft/"
@@ -61,6 +67,91 @@ class ConfigManager:
 
         self._parser.write(full_path, data)
         return self._repo.commit_files([relative_path], message)
+
+    def read(self, name: str) -> ConfigData:
+        """Read a config file as it is on the current branch.
+
+        Args:
+            name: The file's path inside the repository, e.g. ``"app.yaml"``.
+
+        Returns:
+            The parsed configuration.
+
+        Raises:
+            InvalidConfigError: If ``name`` points outside the repository or
+                the file is not valid JSON/YAML.
+            ConfigNotFound: If the file does not exist.
+        """
+        return self._parser.read(self._repo.path / self._resolve_name(name))
+
+    def get_value(self, name: str, key: str) -> Any:
+        """Read one value from a config file using a dotted key.
+
+        Args:
+            name: The file's path inside the repository.
+            key: Where the value is, with dots between levels, e.g.
+                ``"database.port"`` for ``{"database": {"port": 5432}}``.
+
+        Returns:
+            The value, which may itself be a section (a dict) or a list.
+
+        Raises:
+            KeyNotFoundError: If any part of the key does not exist.
+            InvalidConfigError: If the key is malformed, e.g. ``"a..b"``.
+            ConfigNotFound: If the file does not exist.
+        """
+        parts = self._split_key(name, key)
+        current: Any = self.read(name)
+        for part in parts:
+            if not isinstance(current, dict) or part not in current:
+                raise KeyNotFoundError(Path(name), key)
+            current = current[part]
+        return current
+
+    def set_value(
+        self, name: str, key: str, value: Any, message: str | None = None
+    ) -> str | None:
+        """Set one value in a config file and commit the change.
+
+        Missing sections along the key are created, and so is the file itself
+        if it does not exist yet.
+
+        Args:
+            name: The file's path inside the repository.
+            key: Where to put the value, e.g. ``"database.port"``.
+            value: The new value.
+            message: The commit message. Defaults to
+                ``"Set <key> in <name>"``.
+
+        Returns:
+            The new commit's SHA, or ``None`` if the value was already set.
+
+        Raises:
+            InvalidConfigError: If the key is malformed, the file's top level
+                is a list, or part of the key is a plain value rather than a
+                section.
+        """
+        parts = self._split_key(name, key)
+        try:
+            data = self.read(name)
+        except ConfigNotFound:
+            data = {}
+        if not isinstance(data, dict):
+            raise InvalidConfigError(
+                Path(name), "top level is a list, so it has no keys to set"
+            )
+
+        section = data
+        for part in parts[:-1]:
+            child = section.setdefault(part, {})
+            if not isinstance(child, dict):
+                raise InvalidConfigError(
+                    Path(name), f"'{part}' holds a value, not a section"
+                )
+            section = child
+        section[parts[-1]] = value
+
+        return self.save(name, data, message or f"Set {key} in {name}")
 
     def history(self, name: str) -> list[CommitInfo]:
         """List the commits on the current branch that changed a config file.
@@ -259,6 +350,14 @@ class ConfigManager:
         if branch.startswith(DRAFT_PREFIX):
             return branch.removeprefix(DRAFT_PREFIX)
         return None
+
+    @staticmethod
+    def _split_key(name: str, key: str) -> list[str]:
+        """Split ``"a.b.c"`` into ``["a", "b", "c"]``, rejecting empty parts."""
+        parts = key.split(".")
+        if not all(parts):
+            raise InvalidConfigError(Path(name), f"invalid key '{key}'")
+        return parts
 
     def _validate_config(self, path: Path) -> None:
         """Raise InvalidConfigError if a supported config file cannot be parsed."""

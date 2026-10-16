@@ -182,6 +182,21 @@ def test_write_unserializable_data_raises_invalid_config(
     with pytest.raises(InvalidConfigError, match="could not be serialized"):
         parser.write(tmp_path / filename, data)
 
+    # Data is converted before the file is opened, so nothing is left behind.
+    assert not (tmp_path / filename).exists()
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected"),
+    [("app.json", '{\n  "port": 80\n}\n'), ("app.yaml", "port: 80\n")],
+)
+def test_dumps_formats_without_writing(
+    parser: ConfigParser, tmp_path: Path, filename: str, expected: str
+) -> None:
+    """dumps should return the text in the file's format and touch no files."""
+    assert parser.dumps(tmp_path / filename, {"port": 80}) == expected
+    assert list(tmp_path.iterdir()) == []
+
 
 def test_read_os_error_raises_config_cli_error(
     parser: ConfigParser, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
