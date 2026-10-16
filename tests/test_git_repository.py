@@ -89,3 +89,28 @@ def test_open_subfolder_of_repository_raises_invalid_repo(
 
     with pytest.raises(InvalidRepoError, match="not a Git repository"):
         GitRepository.open(subfolder)
+
+
+def test_commit_files_records_file_in_new_commit(config_repo: GitRepository) -> None:
+    """commit_files should create a commit containing the file's content."""
+    (config_repo.path / "app.yaml").write_bytes(b"port: 80\n")
+
+    sha = config_repo.commit_files([Path("app.yaml")], "Add app.yaml")
+
+    head = Repo(config_repo.path).head.commit
+    assert sha == head.hexsha
+    assert head.message == "Add app.yaml"
+    assert (head.tree / "app.yaml").data_stream.read() == b"port: 80\n"
+
+
+def test_commit_files_skips_commit_when_nothing_changed(
+    config_repo: GitRepository,
+) -> None:
+    """Committing an unchanged file should not create an empty commit."""
+    (config_repo.path / "app.yaml").write_bytes(b"port: 80\n")
+    config_repo.commit_files([Path("app.yaml")], "Add app.yaml")
+
+    sha = config_repo.commit_files([Path("app.yaml")], "Again")
+
+    assert sha is None
+    assert len(list(Repo(config_repo.path).iter_commits())) == 2

@@ -85,6 +85,22 @@ class GitRepository:
             raise InvalidRepoError(path, "not a Git repository") from error
         return cls(repo)
 
+    def commit_files(self, paths: list[Path], message: str) -> str | None:
+        """Stage the given files and commit them.
+
+        Args:
+            paths: Files to commit, relative to the repository root.
+            message: The commit message.
+
+        Returns:
+            The new commit's SHA, or ``None`` if the files had no changes,
+            in which case no commit is made.
+        """
+        self._repo.index.add([path.as_posix() for path in paths])
+        if not self._repo.index.diff("HEAD"):
+            return None
+        return self._repo.index.commit(message).hexsha
+
     @property
     def path(self) -> Path:
         """The repository's root folder."""
