@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest import mock
 
 import pytest
-from git import Repo
+from git import GitCommandError, Repo
 
-from config_cli.exceptions import BranchError, InvalidRepoError
+from config_cli.exceptions import BranchError, InvalidRepoError, MergeConflictError
 from config_cli.git_repository import (
     DEFAULT_GITATTRIBUTES,
     DEFAULT_GITIGNORE,
@@ -223,3 +224,152 @@ def test_list_branches_is_sorted(config_repo: GitRepository) -> None:
     config_repo.create_branch("alpha")
 
     assert config_repo.list_branches() == ["alpha", MAIN_BRANCH, "zeta"]
+
+
+# --- Merging ---------------------------------------------------------------
+
+
+def commit_file(repo: GitRepository, name: str, content: bytes, message: str) -> None:
+    """Write a file and commit it on the current branch."""
+    (repo.path / name).write_bytes(content)
+    repo.commit_files([Path(name)], message)
+
+
+@pytest.fixture
+def diverged_repo(config_repo: GitRepository) -> GitRepository:
+    """A repo where 'feature' and main both changed the same line of app.yaml."""
+    commit_file(config_repo, "app.yaml", b"port: 80\n", "Add app.yaml")
+    config_repo.create_branch("feature")
+    commit_file(config_repo, "app.yaml", b"port: 81\n", "Feature port")
+    config_repo.checkout(MAIN_BRANCH)
+    commit_file(config_repo, "app.yaml", b"port: 82\n", "Main port")
+    config_repo.checkout("feature")
+    return config_repo
+
+
+def test_merge_creates_merge_commit_on_target(config_repo: GitRepository) -> None:
+    """A clean merge should add a two-parent merge commit to the target."""
+    config_repo.create_branch("feature")
+    commit_file(config_repo, "app.yaml", b"port: 80\n", "Add app.yaml")
+    repo = Repo(config_repo.path)
+    feature_commit = repo.heads["feature"].commit
+    main_commit = repo.heads[MAIN_BRANCH].commit
+
+    sha = config_repo.merge("feature", MAIN_BRANCH, "Merge feature")
+
+    head = repo.heads[MAIN_BRANCH].commit
+    assert sha == head.hexsha
+    assert head.message.strip() == "Merge feature"
+    assert set(head.parents) == {main_commit, feature_commit}
+    assert (head.tree / "app.yaml").data_stream.read() == b"port: 80\n"
+    assert config_repo.current_branch == MAIN_BRANCH
+
+
+def test_merge_conflict_raises_and_leaves_repo_unchanged(
+    diverged_repo: GitRepository,
+) -> None:
+    """A conflict must be reported, and every branch left as it was."""
+    repo = Repo(diverged_repo.path)
+    main_before = repo.heads[MAIN_BRANCH].commit
+    feature_before = repo.heads["feature"].commit
+
+    with pytest.raises(MergeConflictError) as excinfo:
+        diverged_repo.merge("feature", MAIN_BRANCH, "Merge feature")
+
+    assert excinfo.value.branch == "feature"
+    assert excinfo.value.conflicted_files == ["app.yaml"]
+    assert repo.heads[MAIN_BRANCH].commit == main_before
+    assert repo.heads["feature"].commit == feature_before
+    assert diverged_repo.current_branch == "feature"
+    assert not (Path(repo.git_dir) / "MERGE_HEAD").exists()
+    assert not repo.is_dirty(untracked_files=True)
+    assert (diverged_repo.path / "app.yaml").read_bytes() == b"port: 81\n"
+
+
+def test_merge_other_git_failure_raises_branch_error(
+    config_repo: GitRepository,
+) -> None:
+    """A Git failure that is not a conflict should still be reported cleanly.
+
+    Such failures are hard to cause for real, so the Git command is replaced
+    with a mock that fails the way Git would.
+    """
+    config_repo.create_branch("feature")
+    commit_file(config_repo, "app.yaml", b"port: 80\n", "Add app.yaml")
+    main_before = Repo(config_repo.path).heads[MAIN_BRANCH].commit
+    git_failure = GitCommandError("git merge", 128, b"fatal: something broke")
+    git_class = type(Repo(config_repo.path).git)
+
+    with mock.patch.object(git_class, "merge", create=True, side_effect=git_failure):
+        with pytest.raises(BranchError, match="could not be merged") as excinfo:
+            config_repo.merge("feature", MAIN_BRANCH, "Merge feature")
+
+    assert excinfo.value.__cause__ is git_failure
+    assert Repo(config_repo.path).heads[MAIN_BRANCH].commit == main_before
+    assert config_repo.current_branch == "feature"
+
+
+def test_merge_with_nothing_new_raises(config_repo: GitRepository) -> None:
+    """Merging a branch that adds no commits would be a pointless merge."""
+    config_repo.create_branch("feature")
+
+    with pytest.raises(BranchError, match="no new commits"):
+        config_repo.merge("feature", MAIN_BRANCH, "Merge feature")
+
+
+@pytest.mark.parametrize(("source", "target"), [("nope", MAIN_BRANCH), ("x", "nope")])
+def test_merge_missing_branch_raises(
+    config_repo: GitRepository, source: str, target: str
+) -> None:
+    """Both branches in a merge have to exist."""
+    config_repo.create_branch("x")
+
+    with pytest.raises(BranchError, match="does not exist") as excinfo:
+        config_repo.merge(source, target, "Merge")
+
+    assert excinfo.value.branch == "nope"
+
+
+def test_merge_refuses_uncommitted_changes(config_repo: GitRepository) -> None:
+    """Merging with unsaved edits could mix them into the merge, so refuse."""
+    config_repo.create_branch("feature")
+    commit_file(config_repo, "app.yaml", b"port: 80\n", "Add app.yaml")
+    (config_repo.path / "scratch.yaml").write_bytes(b"a: 1\n")
+
+    with pytest.raises(BranchError, match="uncommitted changes"):
+        config_repo.merge("feature", MAIN_BRANCH, "Merge feature")
+
+
+def test_delete_branch_removes_merged_branch(config_repo: GitRepository) -> None:
+    """A branch that has been merged can be deleted."""
+    config_repo.create_branch("feature")
+    commit_file(config_repo, "app.yaml", b"port: 80\n", "Add app.yaml")
+    config_repo.merge("feature", MAIN_BRANCH, "Merge feature")
+
+    config_repo.delete_branch("feature")
+
+    assert config_repo.list_branches() == [MAIN_BRANCH]
+
+
+def test_delete_branch_refuses_unmerged_work(config_repo: GitRepository) -> None:
+    """Deleting a branch with unmerged commits would lose work, so refuse."""
+    config_repo.create_branch("feature")
+    commit_file(config_repo, "app.yaml", b"port: 80\n", "Add app.yaml")
+    config_repo.checkout(MAIN_BRANCH)
+
+    with pytest.raises(BranchError, match="not merged"):
+        config_repo.delete_branch("feature")
+
+    assert config_repo.branch_exists("feature")
+
+
+def test_delete_branch_refuses_current_branch(config_repo: GitRepository) -> None:
+    """Git cannot delete the branch you are standing on."""
+    with pytest.raises(BranchError, match="checked out"):
+        config_repo.delete_branch(MAIN_BRANCH)
+
+
+def test_delete_missing_branch_raises(config_repo: GitRepository) -> None:
+    """Deleting a branch that does not exist should raise BranchError."""
+    with pytest.raises(BranchError, match="does not exist"):
+        config_repo.delete_branch("nope")

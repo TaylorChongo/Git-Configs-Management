@@ -64,6 +64,8 @@ class BranchError(ConfigCliError):
 class MergeConflictError(ConfigCliError):
     """Raised when publishing a draft branch causes a merge conflict.
 
+    The merge is cancelled before this is raised, so ``main`` is unchanged.
+
     Attributes:
         branch: The draft branch that could not be merged.
         conflicted_files: The files Git could not merge automatically.
@@ -75,5 +77,7 @@ class MergeConflictError(ConfigCliError):
         files = ", ".join(conflicted_files) or "<unknown>"
         super().__init__(
             f"Merge conflict while publishing '{branch}' in: {files}. "
-            "Edit the files to resolve the conflict markers, then try again."
+            "The merge was cancelled and main is unchanged. To resolve it, "
+            "update the draft so these files no longer clash with main, "
+            "then publish again."
         )

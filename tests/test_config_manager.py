@@ -7,7 +7,7 @@ from git import Repo
 
 from config_cli.config_manager import ConfigManager
 from config_cli.config_parser import ConfigParser
-from config_cli.exceptions import BranchError, InvalidConfigError
+from config_cli.exceptions import BranchError, InvalidConfigError, MergeConflictError
 from config_cli.git_repository import MAIN_BRANCH, GitRepository
 
 
@@ -220,3 +220,73 @@ def test_switch_to_missing_draft_raises(manager: ConfigManager) -> None:
     """Switching to an unknown draft should raise BranchError."""
     with pytest.raises(BranchError, match="does not exist"):
         manager.switch_to_draft("nope")
+
+
+# --- Publishing ------------------------------------------------------------
+
+
+def test_publish_merges_draft_into_main_and_deletes_it(
+    manager: ConfigManager, config_repo: GitRepository
+) -> None:
+    """Publishing should put the draft's changes on main and remove the draft."""
+    manager.save("app.yaml", {"port": 5432})
+    manager.start_draft("new-port")
+    manager.save("app.yaml", {"port": 6000})
+
+    sha = manager.publish("new-port")
+
+    head = Repo(config_repo.path).heads[MAIN_BRANCH].commit
+    assert sha == head.hexsha
+    assert head.message.strip() == "Publish draft new-port"
+    assert (head.tree / "app.yaml").data_stream.read() == b"port: 6000\n"
+    assert manager.list_drafts() == []
+    assert config_repo.current_branch == MAIN_BRANCH
+
+
+def test_publish_uses_custom_message(
+    manager: ConfigManager, config_repo: GitRepository
+) -> None:
+    """A caller-supplied message should be used for the merge commit."""
+    manager.start_draft("db")
+    manager.save("db.yaml", {"host": "db1"})
+
+    manager.publish("db", message="Move to db1")
+
+    assert Repo(config_repo.path).head.commit.message.strip() == "Move to db1"
+
+
+def test_publish_conflict_keeps_main_and_draft(
+    manager: ConfigManager, config_repo: GitRepository
+) -> None:
+    """On a conflict, main and the draft must both survive unchanged."""
+    manager.save("app.yaml", {"port": 5432})
+    manager.start_draft("new-port")
+    manager.save("app.yaml", {"port": 6000})
+    manager.switch_to_main()
+    manager.save("app.yaml", {"port": 7000})
+    manager.switch_to_draft("new-port")
+    main_before = Repo(config_repo.path).heads[MAIN_BRANCH].commit
+
+    with pytest.raises(MergeConflictError) as excinfo:
+        manager.publish("new-port")
+
+    assert excinfo.value.conflicted_files == ["app.yaml"]
+    assert Repo(config_repo.path).heads[MAIN_BRANCH].commit == main_before
+    assert manager.list_drafts() == ["new-port"]
+    assert manager.current_draft == "new-port"
+
+
+def test_publish_missing_draft_raises(manager: ConfigManager) -> None:
+    """Publishing a draft that does not exist should raise BranchError."""
+    with pytest.raises(BranchError, match="does not exist"):
+        manager.publish("nope")
+
+
+def test_publish_empty_draft_raises(manager: ConfigManager) -> None:
+    """A draft with no saved changes has nothing to publish."""
+    manager.start_draft("empty")
+
+    with pytest.raises(BranchError, match="no new commits"):
+        manager.publish("empty")
+
+    assert manager.list_drafts() == ["empty"]

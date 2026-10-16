@@ -73,7 +73,8 @@ def test_merge_conflict_error_lists_files_and_guidance() -> None:
     message = str(error)
     assert "draft/db" in message
     assert "app.yaml, db.json" in message
-    assert "resolve" in message
+    assert "main is unchanged" in message
+    assert "publish again" in message
 
 
 def test_merge_conflict_error_without_files_says_unknown() -> None:

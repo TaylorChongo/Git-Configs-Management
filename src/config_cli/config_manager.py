@@ -96,6 +96,31 @@ class ConfigManager:
         """
         self._repo.checkout(MAIN_BRANCH)
 
+    def publish(self, name: str, message: str | None = None) -> str:
+        """Merge a draft into ``main`` and delete the draft.
+
+        On success ``main`` is left checked out. If the draft conflicts with
+        ``main``, nothing changes: ``main``, the draft and the checked-out
+        branch all stay as they were.
+
+        Args:
+            name: The draft to publish.
+            message: The merge commit's message. Defaults to
+                ``"Publish draft <name>"``.
+
+        Returns:
+            The SHA of the merge commit on ``main``.
+
+        Raises:
+            BranchError: If the draft does not exist, has nothing to publish,
+                or there are uncommitted changes.
+            MergeConflictError: If the draft and ``main`` changed the same lines.
+        """
+        branch = DRAFT_PREFIX + name
+        sha = self._repo.merge(branch, MAIN_BRANCH, message or f"Publish draft {name}")
+        self._repo.delete_branch(branch)
+        return sha
+
     def list_drafts(self) -> list[str]:
         """Return the names of all drafts, without the ``draft/`` prefix."""
         return [

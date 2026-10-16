@@ -6,7 +6,7 @@ from pathlib import Path
 
 from git import GitCommandError, InvalidGitRepositoryError, NoSuchPathError, Repo
 
-from config_cli.exceptions import BranchError, InvalidRepoError
+from config_cli.exceptions import BranchError, InvalidRepoError, MergeConflictError
 
 MAIN_BRANCH = "main"
 
@@ -148,6 +148,74 @@ class GitRepository:
 
         self._repo.heads[name].checkout()
 
+    def merge(self, source: str, target: str, message: str) -> str:
+        """Merge ``source`` into ``target`` with a merge commit.
+
+        ``target`` is left checked out on success. On any failure the merge
+        is cancelled and the originally checked-out branch is restored, so the
+        repository looks exactly as it did before the call.
+
+        Args:
+            source: The branch whose changes are merged in.
+            target: The branch that receives the changes.
+            message: The merge commit's message.
+
+        Returns:
+            The SHA of the new merge commit.
+
+        Raises:
+            BranchError: If either branch does not exist, ``source`` has no new
+                commits, there are uncommitted changes, or Git fails for a
+                reason other than a conflict.
+            MergeConflictError: If the branches changed the same lines.
+        """
+        for branch in (source, target):
+            if not self.branch_exists(branch):
+                raise BranchError(branch, "branch does not exist")
+        self._ensure_clean(source)
+
+        source_commit = self._repo.heads[source].commit
+        target_commit = self._repo.heads[target].commit
+        if self._repo.is_ancestor(source_commit, target_commit):
+            raise BranchError(source, f"has no new commits to merge into '{target}'")
+
+        original_branch = self.current_branch
+        self._repo.heads[target].checkout()
+        try:
+            # --no-ff always records a merge commit, so the history shows
+            # exactly when a branch was merged, even if Git could fast-forward.
+            self._repo.git.merge("--no-ff", "-m", message, source)
+        except GitCommandError as error:
+            conflicted_files = self._conflicted_files()
+            self._abort_merge()
+            self._repo.heads[original_branch].checkout()
+            if conflicted_files:
+                raise MergeConflictError(source, conflicted_files) from error
+            raise BranchError(source, f"could not be merged into '{target}'") from error
+
+        return self._repo.head.commit.hexsha
+
+    def delete_branch(self, name: str) -> None:
+        """Delete a branch whose changes are already merged.
+
+        Args:
+            name: The branch to delete.
+
+        Raises:
+            BranchError: If the branch does not exist, is checked out, or has
+                commits that have not been merged yet.
+        """
+        if not self.branch_exists(name):
+            raise BranchError(name, "branch does not exist")
+        if name == self.current_branch:
+            raise BranchError(name, "cannot delete the branch that is checked out")
+        try:
+            # force=False matches `git branch -d`: Git refuses to delete a
+            # branch whose work would be lost.
+            self._repo.delete_head(name, force=False)
+        except GitCommandError as error:
+            raise BranchError(name, "has changes that are not merged") from error
+
     def branch_exists(self, name: str) -> bool:
         """Return whether a local branch called ``name`` exists."""
         return name in self._repo.heads
@@ -162,6 +230,16 @@ class GitRepository:
             self._repo.git.check_ref_format("--branch", name)
         except GitCommandError as error:
             raise BranchError(name, "invalid branch name") from error
+
+    def _conflicted_files(self) -> list[str]:
+        """Return the files left unmerged by a failed merge, sorted."""
+        output = self._repo.git.diff("--name-only", "--diff-filter=U")
+        return sorted(output.splitlines())
+
+    def _abort_merge(self) -> None:
+        """Cancel a merge in progress, if there is one."""
+        if (Path(self._repo.git_dir) / "MERGE_HEAD").exists():
+            self._repo.git.merge("--abort")
 
     def _ensure_clean(self, branch: str) -> None:
         """Raise BranchError if the working tree has uncommitted changes."""
