@@ -2,17 +2,25 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
 import pytest
 from git import GitCommandError, Repo
 
-from config_cli.exceptions import BranchError, InvalidRepoError, MergeConflictError
+from config_cli.exceptions import (
+    BranchError,
+    CommitNotFoundError,
+    ConfigNotFound,
+    InvalidRepoError,
+    MergeConflictError,
+)
 from config_cli.git_repository import (
     DEFAULT_GITATTRIBUTES,
     DEFAULT_GITIGNORE,
     MAIN_BRANCH,
+    CommitInfo,
     GitRepository,
 )
 
@@ -486,3 +494,128 @@ def test_commit_and_checkout_refused_during_merge(
         conflicted_merge.checkout(MAIN_BRANCH)
 
     assert conflicted_merge.current_branch == "feature"
+
+
+# --- History and restoring old versions ------------------------------------
+
+
+@pytest.fixture
+def versioned_repo(config_repo: GitRepository) -> GitRepository:
+    """A repo where app.yaml went through ports 80, 81 and 82."""
+    for port in (80, 81, 82):
+        commit_file(config_repo, "app.yaml", f"port: {port}\n".encode(), f"Port {port}")
+    commit_file(config_repo, "other.yaml", b"a: 1\n", "Add other.yaml")
+    return config_repo
+
+
+def test_file_history_lists_commits_for_that_file_newest_first(
+    versioned_repo: GitRepository,
+) -> None:
+    """Only commits that touched the file are listed, newest first."""
+    history = versioned_repo.file_history(Path("app.yaml"))
+
+    assert [commit.message for commit in history] == ["Port 82", "Port 81", "Port 80"]
+    newest = history[0]
+    assert newest.author == "Test User"
+    assert isinstance(newest.date, datetime)
+    assert newest.short_sha == newest.sha[:7]
+    assert len(newest.short_sha) == 7
+
+
+def test_file_history_of_unknown_file_is_empty(config_repo: GitRepository) -> None:
+    """A file that was never committed has no history."""
+    assert config_repo.file_history(Path("nope.yaml")) == []
+
+
+def test_commit_info_decodes_byte_messages() -> None:
+    """GitPython can return a message as bytes; CommitInfo should give text.
+
+    Making Git produce such a commit for real is awkward, so a mock commit
+    object stands in for it.
+    """
+    fake_commit = mock.Mock(hexsha="a" * 40, summary=b"Caf\xc3\xa9 settings")
+    fake_commit.author.name = None
+
+    info = CommitInfo.from_commit(fake_commit)
+
+    assert info.message == "Café settings"
+    assert info.author == ""
+
+
+@pytest.mark.parametrize("revision_of", ["full", "short", "relative"])
+def test_restore_file_brings_back_old_content(
+    versioned_repo: GitRepository, revision_of: str
+) -> None:
+    """A file can be restored from a full ID, short ID, or HEAD~n."""
+    port_80 = versioned_repo.file_history(Path("app.yaml"))[-1]
+    revision = {
+        "full": port_80.sha,
+        "short": port_80.short_sha,
+        "relative": "HEAD~3",
+    }[revision_of]
+    head_before = Repo(versioned_repo.path).head.commit
+
+    restored_from = versioned_repo.restore_file(Path("app.yaml"), revision)
+
+    assert restored_from.sha == port_80.sha
+    assert (versioned_repo.path / "app.yaml").read_bytes() == b"port: 80\n"
+    # Restoring only changes the file; nothing is committed yet.
+    assert Repo(versioned_repo.path).head.commit == head_before
+
+
+@pytest.mark.parametrize("revision", ["nope", "", "HEAD~99"])
+def test_restore_file_unknown_commit_raises(
+    versioned_repo: GitRepository, revision: str
+) -> None:
+    """Revisions Git cannot find should raise CommitNotFoundError."""
+    with pytest.raises(CommitNotFoundError, match="no such commit") as excinfo:
+        versioned_repo.restore_file(Path("app.yaml"), revision)
+
+    assert excinfo.value.revision == revision
+
+
+def test_restore_file_rejects_ids_that_are_not_commits(
+    versioned_repo: GitRepository,
+) -> None:
+    """A tree or file ID is a real Git object but not a commit."""
+    tree_id = Repo(versioned_repo.path).head.commit.tree.hexsha
+
+    with pytest.raises(CommitNotFoundError, match="no such commit"):
+        versioned_repo.restore_file(Path("app.yaml"), tree_id)
+
+
+def test_restore_file_rejects_commit_from_another_branch(
+    versioned_repo: GitRepository,
+) -> None:
+    """Only commits in the current branch's own history can be restored."""
+    versioned_repo.create_branch("feature")
+    commit_file(versioned_repo, "app.yaml", b"port: 99\n", "Feature only")
+    feature_commit = Repo(versioned_repo.path).head.commit.hexsha
+    versioned_repo.checkout(MAIN_BRANCH)
+
+    with pytest.raises(CommitNotFoundError, match="not in the history of 'main'"):
+        versioned_repo.restore_file(Path("app.yaml"), feature_commit)
+
+
+def test_restore_file_missing_in_that_commit_raises(
+    versioned_repo: GitRepository,
+) -> None:
+    """other.yaml did not exist yet when port was 80."""
+    port_80 = versioned_repo.file_history(Path("app.yaml"))[-1]
+
+    with pytest.raises(ConfigNotFound):
+        versioned_repo.restore_file(Path("other.yaml"), port_80.sha)
+
+    assert (versioned_repo.path / "other.yaml").read_bytes() == b"a: 1\n"
+
+
+def test_restore_file_refuses_uncommitted_changes(
+    versioned_repo: GitRepository,
+) -> None:
+    """Restoring over unsaved edits would destroy them, so refuse."""
+    (versioned_repo.path / "app.yaml").write_bytes(b"port: 1234\n")
+
+    with pytest.raises(BranchError, match="uncommitted changes"):
+        versioned_repo.restore_file(Path("app.yaml"), "HEAD~1")
+
+    assert (versioned_repo.path / "app.yaml").read_bytes() == b"port: 1234\n"

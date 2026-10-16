@@ -8,6 +8,7 @@ import pytest
 
 from config_cli.exceptions import (
     BranchError,
+    CommitNotFoundError,
     ConfigCliError,
     ConfigNotFound,
     InvalidConfigError,
@@ -23,6 +24,7 @@ from config_cli.exceptions import (
         InvalidConfigError(Path("app.yaml"), "bad"),
         InvalidRepoError(Path("repo"), "not a git repository"),
         BranchError("draft/x", "branch already exists"),
+        CommitNotFoundError("abc1234", "no such commit"),
         MergeConflictError("draft/x", ["app.yaml"]),
     ],
 )
@@ -62,6 +64,14 @@ def test_invalid_repo_error_includes_path_and_reason() -> None:
     assert error.path == Path("configs")
     assert "configs" in str(error)
     assert "not a git repository" in str(error)
+
+
+def test_commit_not_found_error_keeps_revision_and_reason() -> None:
+    """CommitNotFoundError should name the commit ID and the problem."""
+    error = CommitNotFoundError("abc1234", "no such commit")
+
+    assert error.revision == "abc1234"
+    assert str(error) == "Commit 'abc1234': no such commit"
 
 
 def test_merge_conflict_error_lists_files_and_guidance() -> None:

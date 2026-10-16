@@ -4,11 +4,26 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
-from git import GitCommandError, InvalidGitRepositoryError, NoSuchPathError, Repo
+from git import (
+    BadName,
+    Commit,
+    GitCommandError,
+    InvalidGitRepositoryError,
+    NoSuchPathError,
+    Repo,
+)
 
-from config_cli.exceptions import BranchError, InvalidRepoError, MergeConflictError
+from config_cli.exceptions import (
+    BranchError,
+    CommitNotFoundError,
+    ConfigNotFound,
+    InvalidRepoError,
+    MergeConflictError,
+)
 
 MAIN_BRANCH = "main"
 
@@ -33,6 +48,41 @@ _INITIAL_FILES = {
 
 # The lines Git writes into a file to mark a conflict: <<<<<<<, ======= and >>>>>>>.
 _CONFLICT_MARKER = re.compile(rb"^(<{7}|={7}|>{7})( |\r?$)", re.MULTILINE)
+
+
+@dataclass(frozen=True)
+class CommitInfo:
+    """A plain summary of one commit, safe to pass outside this module.
+
+    Attributes:
+        sha: The full commit ID.
+        message: The first line of the commit message.
+        author: The name of the commit's author.
+        date: When the commit was made.
+    """
+
+    sha: str
+    message: str
+    author: str
+    date: datetime
+
+    @property
+    def short_sha(self) -> str:
+        """The first 7 characters of the commit ID, as Git usually shows it."""
+        return self.sha[:7]
+
+    @classmethod
+    def from_commit(cls, commit: Commit) -> CommitInfo:
+        """Build a CommitInfo from a GitPython commit object."""
+        summary = commit.summary
+        if isinstance(summary, bytes):
+            summary = summary.decode("utf-8", errors="replace")
+        return cls(
+            sha=commit.hexsha,
+            message=summary,
+            author=commit.author.name or "",
+            date=commit.committed_datetime,
+        )
 
 
 class GitRepository:
@@ -288,6 +338,51 @@ class GitRepository:
         output = self._repo.git.diff("--name-only", "--diff-filter=U")
         return sorted(output.splitlines())
 
+    def file_history(self, path: Path) -> list[CommitInfo]:
+        """Return the commits on the current branch that changed a file.
+
+        Args:
+            path: The file, relative to the repository root.
+
+        Returns:
+            The commits, newest first. Empty if the file was never committed.
+        """
+        commits = self._repo.iter_commits("HEAD", paths=path.as_posix())
+        return [CommitInfo.from_commit(commit) for commit in commits]
+
+    def restore_file(self, path: Path, revision: str) -> CommitInfo:
+        """Put a file back to how it was in an earlier commit.
+
+        The restored file is written to disk and staged, but not committed,
+        so the caller decides the commit message.
+
+        Args:
+            path: The file, relative to the repository root.
+            revision: The commit to take the file from: a full or short
+                commit ID, or anything else Git accepts, such as ``HEAD~1``.
+
+        Returns:
+            The commit the file was restored from.
+
+        Raises:
+            BranchError: If there are uncommitted changes or a merge is in
+                progress.
+            CommitNotFoundError: If the commit does not exist or is not part of
+                the current branch's history.
+            ConfigNotFound: If the file did not exist in that commit.
+        """
+        self._ensure_clean(self.current_branch)
+        commit = self._resolve_commit(revision)
+        try:
+            commit.tree / path.as_posix()
+        except KeyError as error:
+            raise ConfigNotFound(path) from error
+
+        # `git checkout <commit> -- <file>` copies one file out of an old
+        # commit without moving the branch, so history is never rewritten.
+        self._repo.git.checkout(commit.hexsha, "--", path.as_posix())
+        return CommitInfo.from_commit(commit)
+
     def delete_branch(self, name: str) -> None:
         """Delete a branch whose changes are already merged.
 
@@ -323,6 +418,24 @@ class GitRepository:
             self._repo.git.check_ref_format("--branch", name)
         except GitCommandError as error:
             raise BranchError(name, "invalid branch name") from error
+
+    def _resolve_commit(self, revision: str) -> Commit:
+        """Find a commit on the current branch from a user-supplied revision.
+
+        Raises:
+            CommitNotFoundError: If the revision is unknown, is not a commit,
+                or belongs only to another branch.
+        """
+        try:
+            commit = self._repo.commit(revision)
+        except (BadName, ValueError) as error:
+            raise CommitNotFoundError(revision, "no such commit") from error
+
+        if not self._repo.is_ancestor(commit, self._repo.head.commit):
+            raise CommitNotFoundError(
+                revision, f"is not in the history of '{self.current_branch}'"
+            )
+        return commit
 
     def _cancel_merge(self) -> None:
         """Cancel a merge in progress, if there is one."""

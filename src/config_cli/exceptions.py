@@ -61,6 +61,18 @@ class BranchError(ConfigCliError):
         super().__init__(f"Branch '{branch}': {reason}")
 
 
+class CommitNotFoundError(ConfigCliError):
+    """Raised when a commit ID cannot be used, e.g. for a rollback.
+
+    Attributes:
+        revision: The commit ID (or other Git revision) that was given.
+    """
+
+    def __init__(self, revision: str, reason: str) -> None:
+        self.revision = revision
+        super().__init__(f"Commit '{revision}': {reason}")
+
+
 class MergeConflictError(ConfigCliError):
     """Raised when a merge stops because both sides changed the same lines.
 

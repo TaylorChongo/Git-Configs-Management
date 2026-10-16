@@ -7,7 +7,13 @@ from git import Repo
 
 from config_cli.config_manager import ConfigManager
 from config_cli.config_parser import ConfigParser
-from config_cli.exceptions import BranchError, InvalidConfigError, MergeConflictError
+from config_cli.exceptions import (
+    BranchError,
+    CommitNotFoundError,
+    ConfigNotFound,
+    InvalidConfigError,
+    MergeConflictError,
+)
 from config_cli.git_repository import MAIN_BRANCH, GitRepository
 
 
@@ -417,3 +423,111 @@ def test_save_is_refused_during_sync(
         syncing_draft.save("other.yaml", {"a": 1})
 
     assert config_repo.merge_in_progress
+
+
+# --- History and rollback --------------------------------------------------
+
+
+@pytest.fixture
+def three_versions(manager: ConfigManager) -> ConfigManager:
+    """app.yaml saved three times, with ports 5432, 5433 and 5434."""
+    for port in (5432, 5433, 5434):
+        manager.save("app.yaml", {"port": port})
+    return manager
+
+
+def test_history_lists_versions_newest_first(three_versions: ConfigManager) -> None:
+    """history shows every commit that changed the file."""
+    messages = [commit.message for commit in three_versions.history("app.yaml")]
+
+    assert messages == ["Update app.yaml", "Update app.yaml", "Create app.yaml"]
+
+
+def test_history_of_unknown_file_raises(manager: ConfigManager) -> None:
+    """Asking for the history of a file that was never saved is an error."""
+    with pytest.raises(ConfigNotFound):
+        manager.history("nope.yaml")
+
+
+def test_history_rejects_unsafe_name(manager: ConfigManager) -> None:
+    """history uses the same path safety check as save."""
+    with pytest.raises(InvalidConfigError, match="inside the repository"):
+        manager.history("../outside.yaml")
+
+
+def test_rollback_restores_old_version_as_new_commit(
+    three_versions: ConfigManager, config_repo: GitRepository
+) -> None:
+    """Rolling back adds a commit; the old commits stay in the history."""
+    first = three_versions.history("app.yaml")[-1]
+
+    sha = three_versions.rollback("app.yaml", first.short_sha)
+
+    head = Repo(config_repo.path).head.commit
+    assert sha == head.hexsha
+    assert head.message == f"Roll back app.yaml to {first.short_sha}"
+    assert (head.tree / "app.yaml").data_stream.read() == b"port: 5432\n"
+    assert len(three_versions.history("app.yaml")) == 4
+    assert not Repo(config_repo.path).is_dirty(untracked_files=True)
+
+
+def test_rollback_uses_custom_message(
+    three_versions: ConfigManager, config_repo: GitRepository
+) -> None:
+    """A caller-supplied message is used for the rollback commit."""
+    three_versions.rollback("app.yaml", "HEAD~1", message="Undo bad port")
+
+    assert Repo(config_repo.path).head.commit.message == "Undo bad port"
+
+
+def test_rollback_can_itself_be_rolled_back(
+    three_versions: ConfigManager, config_repo: GitRepository
+) -> None:
+    """Because rollback adds a commit, it can be undone like any change."""
+    newest = three_versions.history("app.yaml")[0]
+    three_versions.rollback("app.yaml", "HEAD~2")
+
+    three_versions.rollback("app.yaml", newest.short_sha)
+
+    assert (config_repo.path / "app.yaml").read_bytes() == b"port: 5434\n"
+
+
+def test_rollback_to_current_version_makes_no_commit(
+    three_versions: ConfigManager,
+) -> None:
+    """Rolling back to the version already in place changes nothing."""
+    newest = three_versions.history("app.yaml")[0]
+
+    assert three_versions.rollback("app.yaml", newest.sha) is None
+    assert len(three_versions.history("app.yaml")) == 3
+
+
+def test_rollback_on_draft_does_not_touch_main(
+    three_versions: ConfigManager, config_repo: GitRepository
+) -> None:
+    """A rollback is a normal change, so on a draft it stays off main."""
+    three_versions.start_draft("undo")
+
+    three_versions.rollback("app.yaml", "HEAD~2")
+
+    main_blob = Repo(config_repo.path).heads[MAIN_BRANCH].commit.tree / "app.yaml"
+    assert main_blob.data_stream.read() == b"port: 5434\n"
+    assert (config_repo.path / "app.yaml").read_bytes() == b"port: 5432\n"
+
+
+def test_rollback_to_before_file_existed_raises(
+    three_versions: ConfigManager, config_repo: GitRepository
+) -> None:
+    """The very first commit has no app.yaml, so there is nothing to restore."""
+    initial_commit = list(Repo(config_repo.path).iter_commits())[-1].hexsha
+
+    with pytest.raises(ConfigNotFound):
+        three_versions.rollback("app.yaml", initial_commit)
+
+    assert (config_repo.path / "app.yaml").read_bytes() == b"port: 5434\n"
+
+
+def test_rollback_unknown_commit_raises(three_versions: ConfigManager) -> None:
+    """A commit ID that does not exist should raise CommitNotFoundError."""
+    with pytest.raises(CommitNotFoundError):
+        three_versions.rollback("app.yaml", "deadbeef")

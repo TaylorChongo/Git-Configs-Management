@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from config_cli.config_parser import ConfigData, ConfigParser
-from config_cli.exceptions import InvalidConfigError, MergeConflictError
-from config_cli.git_repository import MAIN_BRANCH, GitRepository
+from config_cli.exceptions import ConfigNotFound, InvalidConfigError, MergeConflictError
+from config_cli.git_repository import MAIN_BRANCH, CommitInfo, GitRepository
 
 DRAFT_PREFIX = "draft/"
 
@@ -60,6 +60,57 @@ class ConfigManager:
             message = f"{action} {relative_path.as_posix()}"
 
         self._parser.write(full_path, data)
+        return self._repo.commit_files([relative_path], message)
+
+    def history(self, name: str) -> list[CommitInfo]:
+        """List the commits on the current branch that changed a config file.
+
+        Args:
+            name: The file's path inside the repository, e.g. ``"app.yaml"``.
+
+        Returns:
+            The commits, newest first.
+
+        Raises:
+            InvalidConfigError: If ``name`` points outside the repository.
+            ConfigNotFound: If the file has never been committed on this branch.
+        """
+        relative_path = self._resolve_name(name)
+        commits = self._repo.file_history(relative_path)
+        if not commits:
+            raise ConfigNotFound(relative_path)
+        return commits
+
+    def rollback(
+        self, name: str, revision: str, message: str | None = None
+    ) -> str | None:
+        """Restore a config file to an earlier version, as a new commit.
+
+        History is never rewritten: the rollback is recorded as a new commit
+        on the current branch, so it can itself be undone later.
+
+        Args:
+            name: The file's path inside the repository, e.g. ``"app.yaml"``.
+            revision: The commit to go back to, usually a short commit ID
+                taken from :meth:`history`.
+            message: The commit message. Defaults to
+                ``"Roll back <name> to <short id>"``.
+
+        Returns:
+            The new commit's SHA, or ``None`` if the file already matched
+            that version.
+
+        Raises:
+            InvalidConfigError: If ``name`` points outside the repository.
+            CommitNotFoundError: If the commit is unknown or not on this branch.
+            ConfigNotFound: If the file did not exist in that commit.
+            BranchError: If there are uncommitted changes or a merge is in
+                progress.
+        """
+        relative_path = self._resolve_name(name)
+        source = self._repo.restore_file(relative_path, revision)
+        if message is None:
+            message = f"Roll back {relative_path.as_posix()} to {source.short_sha}"
         return self._repo.commit_files([relative_path], message)
 
     def start_draft(self, name: str) -> str:
