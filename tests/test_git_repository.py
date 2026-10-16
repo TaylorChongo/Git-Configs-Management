@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from pathlib import Path
 from unittest import mock
@@ -619,3 +620,150 @@ def test_restore_file_refuses_uncommitted_changes(
         versioned_repo.restore_file(Path("app.yaml"), "HEAD~1")
 
     assert (versioned_repo.path / "app.yaml").read_bytes() == b"port: 1234\n"
+
+
+# --- Cloning and temporary clones ------------------------------------------
+
+
+def test_clone_copies_repository(versioned_repo: GitRepository, tmp_path: Path) -> None:
+    """A clone has the same history and files as the original."""
+    target = tmp_path / "copy"
+
+    with GitRepository.clone(str(versioned_repo.path), target) as clone:
+        assert clone.current_branch == MAIN_BRANCH
+        assert (clone.path / "app.yaml").read_bytes() == b"port: 82\n"
+        assert len(clone.file_history(Path("app.yaml"))) == 3
+
+
+def test_clone_can_check_out_a_branch(
+    versioned_repo: GitRepository, tmp_path: Path
+) -> None:
+    """--branch picks which branch the clone starts on."""
+    versioned_repo.create_branch("feature")
+    commit_file(versioned_repo, "app.yaml", b"port: 99\n", "Feature")
+
+    with GitRepository.clone(str(versioned_repo.path), tmp_path / "c", "feature") as c:
+        assert c.current_branch == "feature"
+        assert (c.path / "app.yaml").read_bytes() == b"port: 99\n"
+
+
+def test_clone_into_non_empty_folder_raises(
+    config_repo: GitRepository, tmp_path: Path
+) -> None:
+    """Cloning must never mix files into an existing folder."""
+    target = tmp_path / "busy"
+    target.mkdir()
+    (target / "keep.txt").write_text("mine", encoding="utf-8")
+
+    with pytest.raises(InvalidRepoError, match="not empty"):
+        GitRepository.clone(str(config_repo.path), target)
+
+    assert (target / "keep.txt").read_text(encoding="utf-8") == "mine"
+
+
+def test_clone_of_missing_source_raises(tmp_path: Path) -> None:
+    """A source that is not a repository gives InvalidRepoError."""
+    with pytest.raises(InvalidRepoError, match="could not clone"):
+        GitRepository.clone(str(tmp_path / "nowhere"), tmp_path / "copy")
+
+
+def test_temporary_clone_reads_another_branch_without_switching(
+    versioned_repo: GitRepository,
+) -> None:
+    """The original keeps its branch and files while the clone is in use."""
+    versioned_repo.create_branch("feature")
+    commit_file(versioned_repo, "app.yaml", b"port: 99\n", "Feature")
+
+    with versioned_repo.temporary_clone(MAIN_BRANCH) as clone:
+        assert clone.current_branch == MAIN_BRANCH
+        assert (clone.path / "app.yaml").read_bytes() == b"port: 82\n"
+        clone_folder = clone.path
+
+    assert versioned_repo.current_branch == "feature"
+    assert (versioned_repo.path / "app.yaml").read_bytes() == b"port: 99\n"
+    assert not clone_folder.exists()
+
+
+def test_temporary_clone_defaults_to_current_branch(
+    versioned_repo: GitRepository,
+) -> None:
+    """Without a branch, the clone matches what is checked out."""
+    versioned_repo.create_branch("feature")
+
+    with versioned_repo.temporary_clone() as clone:
+        assert clone.current_branch == "feature"
+
+
+def test_temporary_clone_is_removed_even_after_an_error(
+    versioned_repo: GitRepository,
+) -> None:
+    """The context manager cleans up when the block raises."""
+    folders: list[Path] = []
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with versioned_repo.temporary_clone() as clone:
+            folders.append(clone.path)
+            raise RuntimeError("boom")
+
+    assert not folders[0].exists()
+
+
+def test_temporary_clone_of_missing_branch_raises(
+    versioned_repo: GitRepository,
+) -> None:
+    """Asking for a branch that does not exist fails before cloning."""
+    with pytest.raises(BranchError, match="does not exist"):
+        with versioned_repo.temporary_clone("nope"):
+            pass  # pragma: no cover - never reached
+
+
+def test_repository_context_manager_closes_git(config_repo: GitRepository) -> None:
+    """Leaving the with-block releases GitPython's resources."""
+    repo = GitRepository.open(config_repo.path)
+
+    with mock.patch.object(repo._repo, "close") as close:
+        with repo as entered:
+            assert entered is repo
+        close.assert_called_once_with()
+
+
+# --- Audit trail ------------------------------------------------------------
+
+
+def test_actions_are_recorded_in_the_audit_log(
+    config_repo: GitRepository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Every change to the repository produces a structured audit record."""
+    caplog.set_level(logging.INFO, logger="config_cli")
+
+    commit_file(config_repo, "app.yaml", b"port: 80\n", "Add app.yaml")
+    config_repo.create_branch("feature")
+    commit_file(config_repo, "app.yaml", b"port: 81\n", "Change")
+    config_repo.merge("feature", MAIN_BRANCH, "Merge feature")
+    config_repo.delete_branch("feature")
+
+    events = [record.getMessage() for record in caplog.records]
+    assert events == [
+        "committed",
+        "branch_created",
+        "committed",
+        "merged",
+        "branch_deleted",
+    ]
+    committed = caplog.records[0]
+    assert committed.details["files"] == ["app.yaml"]  # type: ignore[attr-defined]
+    assert committed.details["branch"] == MAIN_BRANCH  # type: ignore[attr-defined]
+
+
+def test_conflicts_are_logged_as_warnings(
+    diverged_repo: GitRepository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A merge conflict is recorded with the files involved."""
+    caplog.set_level(logging.INFO, logger="config_cli")
+
+    with pytest.raises(MergeConflictError):
+        diverged_repo.merge("feature", MAIN_BRANCH, "Merge")
+
+    conflict = next(r for r in caplog.records if r.getMessage() == "merge_conflict")
+    assert conflict.levelno == logging.WARNING
+    assert conflict.details["files"] == ["app.yaml"]  # type: ignore[attr-defined]

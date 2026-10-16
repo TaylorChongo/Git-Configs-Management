@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from unittest import mock
+
 import pytest
 from git import Repo
 
-from config_cli.config_manager import ConfigManager
+from config_cli.config_manager import ConfigManager, RepoStatus
 from config_cli.config_parser import ConfigParser
 from config_cli.exceptions import (
     BranchError,
@@ -649,3 +652,90 @@ def test_set_value_in_list_file_raises(manager: ConfigManager) -> None:
 
     with pytest.raises(InvalidConfigError, match="top level is a list"):
         manager.set_value("servers.yaml", "web3", True)
+
+
+# --- Importing, other branches and status ----------------------------------
+
+
+def test_save_from_file_imports_and_converts(
+    manager: ConfigManager, config_repo: GitRepository, tmp_path: Path
+) -> None:
+    """A local JSON file is stored in the format of the target name."""
+    source = tmp_path / "local.json"
+    source.write_text('{"port": 5432}', encoding="utf-8")
+
+    manager.save_from_file("app.yaml", source)
+
+    assert (config_repo.path / "app.yaml").read_bytes() == b"port: 5432\n"
+
+
+def test_save_from_missing_file_raises(manager: ConfigManager, tmp_path: Path) -> None:
+    """A source file that does not exist is reported as ConfigNotFound."""
+    with pytest.raises(ConfigNotFound):
+        manager.save_from_file("app.yaml", tmp_path / "missing.yaml")
+
+
+def test_read_from_another_branch_leaves_checkout_alone(
+    db_config: ConfigManager, config_repo: GitRepository
+) -> None:
+    """Reading main while on a draft uses a temporary clone, not a checkout."""
+    db_config.start_draft("db")
+    db_config.set_value("app.yaml", "database.port", 6000)
+
+    assert db_config.get_value("app.yaml", "database.port", MAIN_BRANCH) == 5432
+    assert db_config.current_draft == "db"
+    assert db_config.get_value("app.yaml", "database.port") == 6000
+
+
+def test_read_from_missing_branch_raises(db_config: ConfigManager) -> None:
+    """Reading a branch that does not exist is a BranchError."""
+    with pytest.raises(BranchError, match="does not exist"):
+        db_config.read("app.yaml", "nope")
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [("app.json", '{\n  "a": 1\n}\n'), ("app.yaml", "a: 1\n")],
+)
+def test_render_uses_the_names_format(
+    manager: ConfigManager, name: str, expected: str
+) -> None:
+    """render formats data as JSON or YAML depending on the file name."""
+    assert manager.render(name, {"a": 1}) == expected
+
+
+def test_status_on_main(manager: ConfigManager) -> None:
+    """A fresh repository is on main with nothing in progress."""
+    assert manager.status() == RepoStatus(
+        branch=MAIN_BRANCH, draft=None, merge_in_progress=False, conflicted_files=[]
+    )
+
+
+def test_status_during_sync(syncing_draft: ConfigManager) -> None:
+    """status reports the draft and the files that need fixing."""
+    assert syncing_draft.status() == RepoStatus(
+        branch="draft/new-port",
+        draft="new-port",
+        merge_in_progress=True,
+        conflicted_files=["app.yaml"],
+    )
+
+
+# --- Working against the abstractions --------------------------------------
+
+
+def test_manager_works_with_any_version_store() -> None:
+    """ConfigManager depends on the VersionStore abstraction, not on Git.
+
+    A mock stands in for the repository, so this test checks the manager's
+    own logic (wrapping a conflict with draft-specific advice) without Git.
+    """
+    fake_repo = mock.Mock()
+    fake_repo.merge.side_effect = MergeConflictError("draft/db", ["app.yaml"])
+    manager = ConfigManager(fake_repo, ConfigParser())
+
+    with pytest.raises(MergeConflictError, match="Sync the draft with main"):
+        manager.publish("db")
+
+    fake_repo.merge.assert_called_once_with("draft/db", MAIN_BRANCH, "Publish draft db")
+    fake_repo.delete_branch.assert_not_called()

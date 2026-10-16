@@ -2,19 +2,38 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from config_cli.config_parser import ConfigData, ConfigParser
+from config_cli.config_parser import ConfigData
 from config_cli.exceptions import (
     ConfigNotFound,
     InvalidConfigError,
     KeyNotFoundError,
     MergeConflictError,
 )
-from config_cli.git_repository import MAIN_BRANCH, CommitInfo, GitRepository
+from config_cli.git_repository import MAIN_BRANCH, CommitInfo
+from config_cli.interfaces import ConfigFormat, VersionStore
 
 DRAFT_PREFIX = "draft/"
+
+
+@dataclass(frozen=True)
+class RepoStatus:
+    """A snapshot of where the repository stands.
+
+    Attributes:
+        branch: The checked-out branch.
+        draft: The checked-out draft's name, or ``None`` when not on a draft.
+        merge_in_progress: Whether a sync is waiting to be finished.
+        conflicted_files: Files that still need their conflicts resolved.
+    """
+
+    branch: str
+    draft: str | None
+    merge_in_progress: bool
+    conflicted_files: list[str]
 
 
 class ConfigManager:
@@ -25,11 +44,12 @@ class ConfigManager:
     prepared without affecting the published configuration.
 
     The manager does not read files or talk to Git itself. It coordinates a
-    ``ConfigParser`` (file format) and a ``GitRepository`` (version history),
-    which are passed in so either can be swapped out, for example in tests.
+    ``ConfigFormat`` (file format) and a ``VersionStore`` (version history).
+    Both are abstractions, passed in so either can be swapped out, for
+    example for a fake in tests.
     """
 
-    def __init__(self, repo: GitRepository, parser: ConfigParser) -> None:
+    def __init__(self, repo: VersionStore, parser: ConfigFormat) -> None:
         """Create a manager that works on one repository.
 
         Args:
@@ -68,11 +88,37 @@ class ConfigManager:
         self._parser.write(full_path, data)
         return self._repo.commit_files([relative_path], message)
 
-    def read(self, name: str) -> ConfigData:
-        """Read a config file as it is on the current branch.
+    def save_from_file(
+        self, name: str, source: Path, message: str | None = None
+    ) -> str | None:
+        """Copy a local JSON/YAML file into the repository and commit it.
+
+        The data is converted to the format of ``name``, so a JSON file can be
+        saved as YAML and vice versa.
+
+        Args:
+            name: The file's path inside the repository.
+            source: The local file to read.
+            message: The commit message (see :meth:`save`).
+
+        Returns:
+            The new commit's SHA, or ``None`` if the content was unchanged.
+
+        Raises:
+            ConfigNotFound: If ``source`` does not exist.
+            InvalidConfigError: If ``source`` or ``name`` is not valid.
+        """
+        return self.save(name, self._parser.read(source), message)
+
+    def read(self, name: str, branch: str | None = None) -> ConfigData:
+        """Read a config file from the current branch or another branch.
+
+        Reading another branch uses a temporary clone, so the checked-out
+        branch and its files are never touched.
 
         Args:
             name: The file's path inside the repository, e.g. ``"app.yaml"``.
+            branch: The branch to read from. Defaults to the current branch.
 
         Returns:
             The parsed configuration.
@@ -81,16 +127,35 @@ class ConfigManager:
             InvalidConfigError: If ``name`` points outside the repository or
                 the file is not valid JSON/YAML.
             ConfigNotFound: If the file does not exist.
+            BranchError: If ``branch`` does not exist.
         """
-        return self._parser.read(self._repo.path / self._resolve_name(name))
+        relative_path = self._resolve_name(name)
+        if branch is None or branch == self._repo.current_branch:
+            return self._parser.read(self._repo.path / relative_path)
+        with self._repo.temporary_clone(branch) as clone:
+            return self._parser.read(clone.path / relative_path)
 
-    def get_value(self, name: str, key: str) -> Any:
+    def render(self, name: str, data: ConfigData) -> str:
+        """Format data as text in the format ``name`` uses (JSON or YAML)."""
+        return self._parser.dumps(Path(name), data)
+
+    def status(self) -> RepoStatus:
+        """Return the checked-out branch, draft and any unfinished sync."""
+        return RepoStatus(
+            branch=self._repo.current_branch,
+            draft=self.current_draft,
+            merge_in_progress=self._repo.merge_in_progress,
+            conflicted_files=self._repo.conflicted_files(),
+        )
+
+    def get_value(self, name: str, key: str, branch: str | None = None) -> Any:
         """Read one value from a config file using a dotted key.
 
         Args:
             name: The file's path inside the repository.
             key: Where the value is, with dots between levels, e.g.
                 ``"database.port"`` for ``{"database": {"port": 5432}}``.
+            branch: The branch to read from. Defaults to the current branch.
 
         Returns:
             The value, which may itself be a section (a dict) or a list.
@@ -101,7 +166,7 @@ class ConfigManager:
             ConfigNotFound: If the file does not exist.
         """
         parts = self._split_key(name, key)
-        current: Any = self.read(name)
+        current: Any = self.read(name, branch)
         for part in parts:
             if not isinstance(current, dict) or part not in current:
                 raise KeyNotFoundError(Path(name), key)

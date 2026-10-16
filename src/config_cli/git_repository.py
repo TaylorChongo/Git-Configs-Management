@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import re
-from collections.abc import Callable
+import tempfile
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import TracebackType
 
 from git import (
     BadName,
@@ -17,6 +21,7 @@ from git import (
     Repo,
 )
 
+from config_cli.audit import audit
 from config_cli.exceptions import (
     BranchError,
     CommitNotFoundError,
@@ -24,6 +29,8 @@ from config_cli.exceptions import (
     InvalidRepoError,
     MergeConflictError,
 )
+
+_log = logging.getLogger(__name__)
 
 MAIN_BRANCH = "main"
 
@@ -88,8 +95,10 @@ class CommitInfo:
 class GitRepository:
     """A Git repository used as the versioned store for configuration files.
 
-    Create instances with :meth:`init` for a new repository or :meth:`open`
-    for an existing one, rather than calling the constructor directly.
+    Create instances with :meth:`init`, :meth:`open` or :meth:`clone` rather
+    than calling the constructor directly. Instances can be used as context
+    managers (``with GitRepository.open(path) as repo: ...``) to release
+    Git's file handles as soon as the block ends.
     """
 
     def __init__(self, repo: Repo) -> None:
@@ -99,6 +108,21 @@ class GitRepository:
             repo: The GitPython repository to wrap.
         """
         self._repo = repo
+
+    def __enter__(self) -> GitRepository:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Release the background Git processes and open files GitPython holds."""
+        self._repo.close()
 
     @classmethod
     def init(cls, path: Path) -> GitRepository:
@@ -126,8 +150,67 @@ class GitRepository:
         for filename, content in _INITIAL_FILES.items():
             (path / filename).write_text(content, encoding="utf-8", newline="\n")
         repo.index.add(list(_INITIAL_FILES))
-        repo.index.commit("Initialize configuration repository")
+        commit = repo.index.commit("Initialize configuration repository")
+        audit(_log, "repository_initialized", path=str(path), sha=commit.hexsha)
         return cls(repo)
+
+    @classmethod
+    def clone(cls, source: str, path: Path, branch: str | None = None) -> GitRepository:
+        """Clone an existing configuration repository.
+
+        Args:
+            source: A URL or local path of the repository to copy.
+            path: The folder to clone into. It must not exist or be empty.
+            branch: The branch to check out. Defaults to the source's default.
+
+        Returns:
+            The new local copy.
+
+        Raises:
+            InvalidRepoError: If ``path`` is not empty or the clone fails.
+        """
+        if path.exists() and any(path.iterdir()):
+            raise InvalidRepoError(path, "the target folder is not empty")
+        options = [f"--branch={branch}"] if branch is not None else None
+        try:
+            repo = Repo.clone_from(source, path, multi_options=options)
+        except GitCommandError as error:
+            raise InvalidRepoError(path, f"could not clone '{source}'") from error
+        audit(_log, "repository_cloned", source=source, path=str(path), branch=branch)
+        return cls(repo)
+
+    @contextmanager
+    def temporary_clone(self, branch: str | None = None) -> Iterator[GitRepository]:
+        """Clone this repository into a temporary folder for the ``with`` block.
+
+        The clone can be read or changed freely without touching this
+        repository's working files or checked-out branch. It is closed and
+        deleted when the block ends, even if an exception is raised.
+
+        Args:
+            branch: The branch to check out in the clone. Defaults to the
+                branch that is checked out here.
+
+        Yields:
+            The temporary clone.
+
+        Raises:
+            BranchError: If ``branch`` does not exist.
+        """
+        branch = branch if branch is not None else self.current_branch
+        if not self.branch_exists(branch):
+            raise BranchError(branch, "branch does not exist")
+
+        # ignore_cleanup_errors: on Windows a virus scanner or indexer can
+        # briefly lock a file; a leftover temp folder is better than a crash.
+        with tempfile.TemporaryDirectory(
+            prefix="config-cli-", ignore_cleanup_errors=True
+        ) as folder:
+            clone = GitRepository.clone(str(self.path), Path(folder) / "repo", branch)
+            try:
+                yield clone
+            finally:
+                clone.close()
 
     @classmethod
     def open(cls, path: Path) -> GitRepository:
@@ -168,9 +251,20 @@ class GitRepository:
         """
         self._ensure_no_merge_in_progress()
         self._repo.index.add([path.as_posix() for path in paths])
+        files = [path.as_posix() for path in paths]
         if not self._repo.index.diff("HEAD"):
+            audit(_log, "commit_skipped", branch=self.current_branch, files=files)
             return None
-        return self._repo.index.commit(message).hexsha
+        sha = self._repo.index.commit(message).hexsha
+        audit(
+            _log,
+            "committed",
+            branch=self.current_branch,
+            sha=sha,
+            files=files,
+            message=message,
+        )
+        return sha
 
     def create_branch(self, name: str, start_point: str = MAIN_BRANCH) -> None:
         """Create a new branch from ``start_point`` and check it out.
@@ -191,6 +285,7 @@ class GitRepository:
         self._ensure_clean(name)
 
         self._repo.create_head(name, self._repo.heads[start_point].commit).checkout()
+        audit(_log, "branch_created", branch=name, start_point=start_point)
 
     def checkout(self, name: str) -> None:
         """Switch to an existing branch.
@@ -207,6 +302,7 @@ class GitRepository:
         self._ensure_clean(name)
 
         self._repo.heads[name].checkout()
+        audit(_log, "branch_checked_out", branch=name)
 
     def merge(
         self, source: str, target: str, message: str, keep_conflicts: bool = False
@@ -258,6 +354,15 @@ class GitRepository:
             self._repo.git.merge("--no-ff", "-m", message, source)
         except GitCommandError as error:
             conflicted_files = self.conflicted_files()
+            audit(
+                _log,
+                "merge_conflict" if conflicted_files else "merge_failed",
+                logging.WARNING if conflicted_files else logging.ERROR,
+                source=source,
+                target=target,
+                files=conflicted_files,
+                kept_open=bool(conflicted_files and keep_conflicts),
+            )
             if conflicted_files and keep_conflicts:
                 raise MergeConflictError(
                     source,
@@ -277,7 +382,9 @@ class GitRepository:
                 ) from error
             raise BranchError(source, f"could not be merged into '{target}'") from error
 
-        return self._repo.head.commit.hexsha
+        sha = self._repo.head.commit.hexsha
+        audit(_log, "merged", source=source, target=target, sha=sha)
+        return sha
 
     def finish_merge(self, validate: Callable[[Path], None] | None = None) -> str:
         """Commit a merge whose conflicts the user has fixed by hand.
@@ -317,7 +424,9 @@ class GitRepository:
             self._repo.git.add("--", *files)
         # --no-edit reuses the message Git saved when the merge started.
         self._repo.git.commit("--no-edit")
-        return self._repo.head.commit.hexsha
+        sha = self._repo.head.commit.hexsha
+        audit(_log, "merge_finished", branch=self.current_branch, sha=sha, files=files)
+        return sha
 
     def abort_merge(self) -> None:
         """Cancel the merge in progress, restoring the files to before it began.
@@ -328,6 +437,7 @@ class GitRepository:
         if not self.merge_in_progress:
             raise BranchError(self.current_branch, "no merge is in progress")
         self._cancel_merge()
+        audit(_log, "merge_aborted", branch=self.current_branch)
 
     def conflicted_files(self) -> list[str]:
         """Return the files Git could not merge automatically, sorted.
@@ -381,6 +491,13 @@ class GitRepository:
         # `git checkout <commit> -- <file>` copies one file out of an old
         # commit without moving the branch, so history is never rewritten.
         self._repo.git.checkout(commit.hexsha, "--", path.as_posix())
+        audit(
+            _log,
+            "file_restored",
+            branch=self.current_branch,
+            file=path.as_posix(),
+            from_commit=commit.hexsha,
+        )
         return CommitInfo.from_commit(commit)
 
     def delete_branch(self, name: str) -> None:
@@ -403,6 +520,7 @@ class GitRepository:
             self._repo.delete_head(name, force=False)
         except GitCommandError as error:
             raise BranchError(name, "has changes that are not merged") from error
+        audit(_log, "branch_deleted", branch=name)
 
     def branch_exists(self, name: str) -> bool:
         """Return whether a local branch called ``name`` exists."""
