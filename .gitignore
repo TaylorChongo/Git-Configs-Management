@@ -8,3 +8,10 @@ __pycache__/
 .venv/
 build/
 dist/
+coverage.xml
+reports/htmlcov/
+reports/pytest-run.txt
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore

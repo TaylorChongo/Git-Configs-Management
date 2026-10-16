@@ -1,0 +1,13 @@
+Name                               Stmts   Miss Branch BrPart  Cover   Missing
+------------------------------------------------------------------------------
+src\config_cli\__init__.py             3      0      0      0   100%
+src\config_cli\__main__.py             2      0      0      0   100%
+src\config_cli\audit.py               52      0     10      0   100%
+src\config_cli\cli.py                206      0     26      1    99%   362->366
+src\config_cli\config_manager.py     127      0     28      1    99%   429->exit
+src\config_cli\config_parser.py       50      0     10      0   100%
+src\config_cli\exceptions.py          35      0      0      0   100%
+src\config_cli\git_repository.py     223      0     54      2    99%   420->419, 423->426
+src\config_cli\interfaces.py          30      0      0      0   100%
+------------------------------------------------------------------------------
+TOTAL                                728      0    128      4    99%
